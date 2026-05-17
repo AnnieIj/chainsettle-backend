@@ -1,0 +1,155 @@
+// prisma/schema.prisma
+// ChainSettle — Database schema
+// Run: npx prisma migrate dev --name init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// ENUMS (mirror the on-chain contract enums)
+// ============================================================
+
+enum ShipmentStatus {
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+enum MilestoneStatus {
+  PENDING
+  PROOF_SUBMITTED
+  CONFIRMED
+  DISPUTED
+  RESOLVED
+}
+
+enum NotificationType {
+  SHIPMENT_CREATED
+  PROOF_SUBMITTED
+  MILESTONE_CONFIRMED
+  DISPUTE_RAISED
+  DISPUTE_RESOLVED
+  SHIPMENT_CANCELLED
+  PAYMENT_RELEASED
+}
+
+enum UserRole {
+  BUYER
+  SUPPLIER
+  LOGISTICS
+  ARBITER
+  ADMIN
+}
+
+// ============================================================
+// MODELS
+// ============================================================
+
+model User {
+  id               String    @id @default(uuid())
+  stellarAddress   String    @unique
+  email            String?   @unique
+  name             String?
+  role             UserRole  @default(BUYER)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  // Relations
+  buyerShipments     Shipment[]     @relation("BuyerShipments")
+  supplierShipments  Shipment[]     @relation("SupplierShipments")
+  logisticsShipments Shipment[]     @relation("LogisticsShipments")
+  arbiterShipments   Shipment[]     @relation("ArbiterShipments")
+  notifications      Notification[]
+
+  @@map("users")
+}
+
+model Shipment {
+  id               String          @id  // matches on-chain shipment_id
+  buyerAddress     String
+  supplierAddress  String
+  logisticsAddress String
+  arbiterAddress   String
+  tokenAddress     String
+  totalAmount      BigInt          // stored in stroops (smallest unit)
+  releasedAmount   BigInt          @default(0)
+  status           ShipmentStatus  @default(ACTIVE)
+  txHash           String?         // ledger tx hash of creation
+  createdLedger    Int?            // ledger sequence at creation
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  // Relations
+  buyer     User        @relation("BuyerShipments", fields: [buyerAddress], references: [stellarAddress])
+  supplier  User        @relation("SupplierShipments", fields: [supplierAddress], references: [stellarAddress])
+  logistics User        @relation("LogisticsShipments", fields: [logisticsAddress], references: [stellarAddress])
+  arbiter   User        @relation("ArbiterShipments", fields: [arbiterAddress], references: [stellarAddress])
+  milestones Milestone[]
+  events    ChainEvent[]
+
+  @@map("shipments")
+}
+
+model Milestone {
+  id              String          @id @default(uuid())
+  shipmentId      String
+  milestoneIndex  Int             // 0-based index matching on-chain
+  name            String
+  paymentPercent  Int             // 0-100
+  proofHash       String?         // IPFS CID submitted by supplier/logistics
+  status          MilestoneStatus @default(PENDING)
+  paymentReleased BigInt?         // exact amount released for this milestone
+  confirmedAt     DateTime?
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  // Relations
+  shipment Shipment @relation(fields: [shipmentId], references: [id])
+
+  @@unique([shipmentId, milestoneIndex])
+  @@map("milestones")
+}
+
+model ChainEvent {
+  id          String   @id @default(uuid())
+  shipmentId  String?
+  eventName   String   // e.g. "shipment_created", "milestone_confirmed"
+  ledger      Int
+  txHash      String
+  payload     Json     // raw event payload from Stellar
+  processed   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  // Relations
+  shipment Shipment? @relation(fields: [shipmentId], references: [id])
+
+  @@index([shipmentId])
+  @@index([eventName])
+  @@index([processed])
+  @@map("chain_events")
+}
+
+model Notification {
+  id         String           @id @default(uuid())
+  userId     String
+  type       NotificationType
+  title      String
+  message    String
+  data       Json?            // extra context (shipmentId, amount, etc.)
+  read       Boolean          @default(false)
+  emailSent  Boolean          @default(false)
+  createdAt  DateTime         @default(now())
+
+  // Relations
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([read])
+  @@map("notifications")
+}
