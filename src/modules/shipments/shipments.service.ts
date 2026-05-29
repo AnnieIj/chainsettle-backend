@@ -8,6 +8,7 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { StellarService } from '../../common/stellar/stellar.service';
 import { CreateShipmentDto } from './dto/create-shipment.dto';
 import { ShipmentStatus } from '@prisma/client';
+import { nativeToScVal } from '@stellar/stellar-sdk';
 
 @Injectable()
 export class ShipmentsService {
@@ -113,12 +114,20 @@ export class ShipmentsService {
 
   async syncStatusFromChain(shipmentId: string) {
     try {
+      // Convert shipmentId to ScVal String for contract call
+      const shipmentIdScVal = nativeToScVal(shipmentId, { type: 'string' });
+      
       const onChain = await this.stellar.simulateContractCall('get_shipment', [
-        // TODO: convert shipmentId to ScVal String
-        // nativeToScVal(shipmentId, { type: 'string' })
+        shipmentIdScVal,
       ]);
 
-      if (!onChain) return;
+      // If contract returns null, shipment doesn't exist on-chain yet
+      if (!onChain) {
+        this.logger.warn(
+          `Shipment ${shipmentId} not found on-chain. It may not be created yet or the ID is incorrect.`
+        );
+        return;
+      }
 
       // Map on-chain status to Prisma enum
       const statusMap: Record<string, ShipmentStatus> = {
@@ -127,17 +136,45 @@ export class ShipmentsService {
         Cancelled: ShipmentStatus.CANCELLED,
       };
 
+      const mappedStatus = statusMap[onChain.status];
+      
+      if (!mappedStatus) {
+        this.logger.warn(
+          `Unknown on-chain status "${onChain.status}" for shipment ${shipmentId}. Skipping update.`
+        );
+        return;
+      }
+
+      // Parse released amount - handle both string and number formats
+      const releasedAmount = onChain.released_amount 
+        ? BigInt(onChain.released_amount.toString())
+        : BigInt(0);
+
       await this.prisma.shipment.update({
         where: { id: shipmentId },
         data: {
-          status: statusMap[onChain.status] ?? ShipmentStatus.ACTIVE,
-          releasedAmount: BigInt(onChain.released_amount ?? 0),
+          status: mappedStatus,
+          releasedAmount,
         },
       });
 
-      this.logger.log(`Synced shipment ${shipmentId} from chain`);
+      this.logger.log(
+        `Synced shipment ${shipmentId} from chain: status=${mappedStatus}, releasedAmount=${releasedAmount}`
+      );
     } catch (error) {
-      this.logger.error(`Failed to sync shipment ${shipmentId}`, error.message);
+      // Check if it's a "shipment not found in DB" error
+      if (error.code === 'P2025') {
+        this.logger.warn(
+          `Cannot sync shipment ${shipmentId}: not found in database`
+        );
+        return;
+      }
+      
+      this.logger.error(
+        `Failed to sync shipment ${shipmentId} from chain: ${error.message}`,
+        error.stack
+      );
+      // Don't throw - allow the process to continue
     }
   }
 
