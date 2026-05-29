@@ -1,0 +1,87 @@
+import { Injectable, OnModuleDestroy, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import Redis from 'ioredis';
+
+/**
+ * Redis service for shared state across pods
+ * Used for nonce storage and rate limiting
+ */
+@Injectable()
+export class RedisService implements OnModuleDestroy {
+  private readonly logger = new Logger(RedisService.name);
+  private readonly client: Redis;
+
+  constructor(private readonly configService: ConfigService) {
+    const redisUrl = this.configService.get<string>('REDIS_URL', 'redis://localhost:6379');
+    
+    this.client = new Redis(redisUrl, {
+      maxRetriesPerRequest: 3,
+      enableReadyCheck: true,
+      lazyConnect: false,
+      retryStrategy: (times) => {
+        const delay = Math.min(times * 50, 2000);
+        return delay;
+      },
+    });
+
+    this.client.on('connect', () => {
+      this.logger.log('Redis connected');
+    });
+
+    this.client.on('error', (err) => {
+      this.logger.error('Redis connection error:', err);
+    });
+
+    this.client.on('ready', () => {
+      this.logger.log('Redis ready');
+    });
+  }
+
+  async onModuleDestroy() {
+    await this.client.quit();
+  }
+
+  getClient(): Redis {
+    return this.client;
+  }
+
+  /**
+   * Set a key with expiration (in seconds)
+   */
+  async set(key: string, value: string, ttlSeconds?: number): Promise<void> {
+    if (ttlSeconds) {
+      await this.client.setex(key, ttlSeconds, value);
+    } else {
+      await this.client.set(key, value);
+    }
+  }
+
+  /**
+   * Get a key
+   */
+  async get(key: string): Promise<string | null> {
+    return this.client.get(key);
+  }
+
+  /**
+   * Delete a key
+   */
+  async del(key: string): Promise<void> {
+    await this.client.del(key);
+  }
+
+  /**
+   * Check if key exists
+   */
+  async exists(key: string): Promise<boolean> {
+    const result = await this.client.exists(key);
+    return result === 1;
+  }
+
+  /**
+   * Get TTL of a key (in seconds)
+   */
+  async ttl(key: string): Promise<number> {
+    return this.client.ttl(key);
+  }
+}

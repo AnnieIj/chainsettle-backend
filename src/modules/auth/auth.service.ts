@@ -1,6 +1,7 @@
 import { Injectable, UnauthorizedException, Logger } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { PrismaService } from '../../common/prisma/prisma.service';
+import { RedisService } from '../../common/redis/redis.service';
 import { LoginDto } from './dto/login.dto';
 
 /**
@@ -21,25 +22,26 @@ import { LoginDto } from './dto/login.dto';
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
-
-  // In-memory nonce store — replace with Redis in production
-  private readonly nonces = new Map<string, { nonce: string; expiresAt: number }>();
+  private readonly NONCE_PREFIX = 'nonce:';
+  private readonly NONCE_TTL = 5 * 60; // 5 minutes in seconds
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwt: JwtService,
+    private readonly redis: RedisService,
   ) {}
 
   // ----------------------------------------------------------
   // STEP 1: Generate a challenge nonce for an address
   // ----------------------------------------------------------
 
-  generateNonce(stellarAddress: string): string {
+  async generateNonce(stellarAddress: string): Promise<string> {
     const nonce = `chainsetttle:${stellarAddress}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
-    this.nonces.set(stellarAddress, {
-      nonce,
-      expiresAt: Date.now() + 5 * 60 * 1000, // 5 minutes
-    });
+    const key = `${this.NONCE_PREFIX}${stellarAddress}`;
+    
+    // Store in Redis with 5-minute expiration
+    await this.redis.set(key, nonce, this.NONCE_TTL);
+    
     return nonce;
   }
 
@@ -50,16 +52,18 @@ export class AuthService {
   async login(dto: LoginDto): Promise<{ accessToken: string; user: any }> {
     const { stellarAddress, signedNonce, signature } = dto;
 
-    // Retrieve the stored nonce
-    const stored = this.nonces.get(stellarAddress);
-    if (!stored || Date.now() > stored.expiresAt) {
+    // Retrieve the stored nonce from Redis
+    const key = `${this.NONCE_PREFIX}${stellarAddress}`;
+    const storedNonce = await this.redis.get(key);
+    
+    if (!storedNonce) {
       throw new UnauthorizedException('Nonce expired or not found. Request a new one.');
     }
 
     // Verify the signature
     // TODO: wire up actual Stellar keypair.verify() call
     // const keypair = Keypair.fromPublicKey(stellarAddress);
-    // const isValid = keypair.verify(Buffer.from(stored.nonce), Buffer.from(signature, 'base64'));
+    // const isValid = keypair.verify(Buffer.from(storedNonce), Buffer.from(signature, 'base64'));
     // if (!isValid) throw new UnauthorizedException('Invalid signature');
     const isValid = true; // STUB — replace before production
 
@@ -68,7 +72,7 @@ export class AuthService {
     }
 
     // Clear the nonce — one-time use
-    this.nonces.delete(stellarAddress);
+    await this.redis.del(key);
 
     // Upsert user in the database
     const user = await this.prisma.user.upsert({

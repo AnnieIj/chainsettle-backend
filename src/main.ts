@@ -5,6 +5,7 @@ import { ConfigService } from '@nestjs/config';
 import helmet from 'helmet';
 import { AppModule } from './app.module';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
+import { ThrottlerExceptionFilter } from './common/filters/throttler-exception.filter';
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
 
 async function bootstrap() {
@@ -41,7 +42,10 @@ async function bootstrap() {
   );
 
   // Global exception filter — standardised error responses
-  app.useGlobalFilters(new HttpExceptionFilter());
+  app.useGlobalFilters(
+    new HttpExceptionFilter(),
+    new ThrottlerExceptionFilter(),
+  );
 
   // Global response transform — wraps all responses in { success, data, timestamp }
   app.useGlobalInterceptors(new TransformInterceptor());
