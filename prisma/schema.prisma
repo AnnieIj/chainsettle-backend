@@ -129,9 +129,11 @@ model ChainEvent {
   // Relations
   shipment Shipment? @relation(fields: [shipmentId], references: [id])
 
+  @@unique([txHash, eventName])
   @@index([shipmentId])
   @@index([eventName])
   @@index([processed])
+  @@index([ledger])
   @@map("chain_events")
 }
 
@@ -152,4 +154,19 @@ model Notification {
   @@index([userId])
   @@index([read])
   @@map("notifications")
+}
+
+// ============================================================
+// LEDGER CURSOR (singleton row — key = 'main')
+// ============================================================
+
+// Persists the last successfully processed Stellar ledger sequence number.
+// A single row with id = 'main' acts as a singleton so the event poller
+// can resume from exactly the right point after any restart or crash.
+model EventCursor {
+  id                  String   @id // always 'main'
+  lastProcessedLedger Int
+  updatedAt           DateTime @updatedAt
+
+  @@map("event_cursors")
 }
