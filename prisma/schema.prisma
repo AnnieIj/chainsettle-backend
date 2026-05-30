@@ -38,6 +38,7 @@ enum NotificationType {
   DISPUTE_EVIDENCE_SUBMITTED
   SHIPMENT_CANCELLED
   PAYMENT_RELEASED
+  MILESTONE_OVERDUE
 }
 
 enum DisputeRole {
@@ -104,17 +105,19 @@ model Shipment {
 }
 
 model Milestone {
-  id              String          @id @default(uuid())
-  shipmentId      String
-  milestoneIndex  Int             // 0-based index matching on-chain
-  name            String
-  paymentPercent  Int             // 0-100
-  proofHash       String?         // IPFS CID submitted by supplier/logistics
-  status          MilestoneStatus @default(PENDING)
-  paymentReleased BigInt?         // exact amount released for this milestone
-  confirmedAt     DateTime?
-  createdAt       DateTime        @default(now())
-  updatedAt       DateTime        @updatedAt
+  id                 String          @id @default(uuid())
+  shipmentId         String
+  milestoneIndex     Int             // 0-based index matching on-chain
+  name               String
+  paymentPercent     Int             // 0-100
+  proofHash          String?         // IPFS CID submitted by supplier/logistics
+  status             MilestoneStatus @default(PENDING)
+  paymentReleased    BigInt?         // exact amount released for this milestone
+  confirmedAt        DateTime?
+  dueAt              DateTime?       // optional deadline for milestone completion
+  overdueNotifiedAt  DateTime?       // timestamp when overdue notification was sent (prevents re-notification)
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
 
   // Relations
   shipment        Shipment          @relation(fields: [shipmentId], references: [id])

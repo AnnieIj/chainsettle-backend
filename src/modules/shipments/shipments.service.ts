@@ -51,6 +51,7 @@ export class ShipmentsService {
             milestoneIndex: index,
             name: m.name,
             paymentPercent: m.paymentPercent,
+            ...(m.dueAt ? { dueAt: new Date(m.dueAt) } : {}),
           })),
         },
       },
@@ -183,14 +184,25 @@ export class ShipmentsService {
   // ----------------------------------------------------------
 
   private serialize(shipment: any) {
+    const now = new Date();
     return {
       ...shipment,
       totalAmount: shipment.totalAmount?.toString(),
       releasedAmount: shipment.releasedAmount?.toString(),
-      milestones: shipment.milestones?.map((m: any) => ({
-        ...m,
-        paymentReleased: m.paymentReleased?.toString() ?? null,
-      })),
+      milestones: shipment.milestones?.map((m: any) => {
+        // A milestone is overdue if: dueAt < now AND status is not CONFIRMED or RESOLVED
+        const isOverdue =
+          m.dueAt && 
+          m.dueAt < now && 
+          m.status !== 'CONFIRMED' && 
+          m.status !== 'RESOLVED';
+
+        return {
+          ...m,
+          paymentReleased: m.paymentReleased?.toString() ?? null,
+          isOverdue: Boolean(isOverdue),
+        };
+      }),
     };
   }
 }

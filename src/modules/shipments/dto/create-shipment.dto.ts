@@ -7,6 +7,7 @@ import {
   Min,
   Max,
   IsOptional,
+  IsISO8601,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { ApiProperty } from '@nestjs/swagger';
@@ -22,6 +23,11 @@ export class MilestoneDto {
   @Min(1)
   @Max(100)
   paymentPercent: number;
+
+  @ApiProperty({ required: false, example: '2026-06-30T23:59:59Z', description: 'Optional milestone deadline (ISO 8601)' })
+  @IsOptional()
+  @IsISO8601()
+  dueAt?: string;
 }
 
 export class CreateShipmentDto {
