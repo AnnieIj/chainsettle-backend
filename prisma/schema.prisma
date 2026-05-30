@@ -35,9 +35,15 @@ enum NotificationType {
   MILESTONE_CONFIRMED
   DISPUTE_RAISED
   DISPUTE_RESOLVED
+  DISPUTE_EVIDENCE_SUBMITTED
   SHIPMENT_CANCELLED
   PAYMENT_RELEASED
   MILESTONE_OVERDUE
+}
+
+enum DisputeRole {
+  BUYER
+  SUPPLIER
 }
 
 enum UserRole {
@@ -62,11 +68,12 @@ model User {
   updatedAt        DateTime  @updatedAt
 
   // Relations
-  buyerShipments     Shipment[]     @relation("BuyerShipments")
-  supplierShipments  Shipment[]     @relation("SupplierShipments")
-  logisticsShipments Shipment[]     @relation("LogisticsShipments")
-  arbiterShipments   Shipment[]     @relation("ArbiterShipments")
+  buyerShipments     Shipment[]        @relation("BuyerShipments")
+  supplierShipments  Shipment[]        @relation("SupplierShipments")
+  logisticsShipments Shipment[]        @relation("LogisticsShipments")
+  arbiterShipments   Shipment[]        @relation("ArbiterShipments")
   notifications      Notification[]
+  disputeEvidence    DisputeEvidence[]
 
   @@map("users")
 }
@@ -120,10 +127,32 @@ model Milestone {
   updatedAt          DateTime        @updatedAt
 
   // Relations
-  shipment Shipment @relation(fields: [shipmentId], references: [id])
+  shipment        Shipment          @relation(fields: [shipmentId], references: [id])
+  disputeEvidence DisputeEvidence[]
 
   @@unique([shipmentId, milestoneIndex])
   @@map("milestones")
+}
+
+model DisputeEvidence {
+  id          String      @id @default(uuid())
+  milestoneId String
+  submittedBy String      // Stellar address
+  role        DisputeRole // BUYER or SUPPLIER
+  description String      @db.Text
+  ipfsCid     String?     // IPFS hash of uploaded file
+  fileName    String?     // Original filename
+  fileSize    Int?        // File size in bytes
+  mimeType    String?     // MIME type of file
+  createdAt   DateTime    @default(now())
+
+  // Relations
+  milestone Milestone @relation(fields: [milestoneId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [submittedBy], references: [stellarAddress])
+
+  @@index([milestoneId])
+  @@index([submittedBy])
+  @@map("dispute_evidence")
 }
 
 model ChainEvent {

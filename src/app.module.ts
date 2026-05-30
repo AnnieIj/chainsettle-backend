@@ -8,6 +8,7 @@ import { APP_GUARD } from '@nestjs/core';
 import { PrismaModule } from './common/prisma/prisma.module';
 import { StellarModule } from './common/stellar/stellar.module';
 import { RedisModule } from './common/redis/redis.module';
+import { IpfsModule } from './common/ipfs/ipfs.module';
 import { RedisThrottlerStorageService } from './common/throttler/redis-throttler-storage.service';
 
 import { AuthModule } from './modules/auth/auth.module';
@@ -51,6 +52,7 @@ import { HealthModule } from './modules/health/health.module';
     PrismaModule,
     StellarModule,
     RedisModule,
+    IpfsModule,
 
     // Feature modules
     AuthModule,

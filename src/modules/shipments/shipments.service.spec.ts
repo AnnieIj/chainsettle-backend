@@ -313,6 +313,203 @@ describe('ShipmentsService', () => {
           }),
         }),
       );
+  describe('syncStatusFromChain()', () => {
+    const shipmentId = 'SHIP-001';
+
+    it('successfully syncs shipment status and released amount from chain', async () => {
+      const onChainData = {
+        status: 'Active',
+        released_amount: '5000000',
+      };
+
+      mockStellar.simulateContractCall.mockResolvedValue(onChainData);
+      mockPrisma.shipment.update.mockResolvedValue({
+        id: shipmentId,
+        status: ShipmentStatus.ACTIVE,
+        releasedAmount: BigInt(5000000),
+      });
+
+      await service.syncStatusFromChain(shipmentId);
+
+      // Verify simulateContractCall was called with correct arguments
+      expect(mockStellar.simulateContractCall).toHaveBeenCalledWith(
+        'get_shipment',
+        [nativeToScVal(shipmentId, { type: 'string' })]
+      );
+
+      // Verify database update was called with correct data
+      expect(mockPrisma.shipment.update).toHaveBeenCalledWith({
+        where: { id: shipmentId },
+        data: {
+          status: ShipmentStatus.ACTIVE,
+          releasedAmount: BigInt(5000000),
+        },
+      });
+    });
+
+    it('syncs Completed status correctly', async () => {
+      const onChainData = {
+        status: 'Completed',
+        released_amount: '10000000',
+      };
+
+      mockStellar.simulateContractCall.mockResolvedValue(onChainData);
+      mockPrisma.shipment.update.mockResolvedValue({});
+
+      await service.syncStatusFromChain(shipmentId);
+
+      expect(mockPrisma.shipment.update).toHaveBeenCalledWith({
+        where: { id: shipmentId },
+        data: {
+          status: ShipmentStatus.COMPLETED,
+          releasedAmount: BigInt(10000000),
+        },
+      });
+    });
+
+    it('syncs Cancelled status correctly', async () => {
+      const onChainData = {
+        status: 'Cancelled',
+        released_amount: '2500000',
+      };
+
+      mockStellar.simulateContractCall.mockResolvedValue(onChainData);
+      mockPrisma.shipment.update.mockResolvedValue({});
+
+      await service.syncStatusFromChain(shipmentId);
+
+      expect(mockPrisma.shipment.update).toHaveBeenCalledWith({
+        where: { id: shipmentId },
+        data: {
+          status: ShipmentStatus.CANCELLED,
+          releasedAmount: BigInt(2500000),
+        },
+      });
+    });
+
+    it('logs warning and returns when shipment not found on-chain (null response)', async () => {
+      mockStellar.simulateContractCall.mockResolvedValue(null);
+
+      await service.syncStatusFromChain(shipmentId);
+
+      // Should not attempt to update database
+      expect(mockPrisma.shipment.update).not.toHaveBeenCalled();
+    });
+
+    it('logs warning and returns when on-chain status is unknown', async () => {
+      const onChainData = {
+        status: 'UnknownStatus',
+        released_amount: '1000000',
+      };
+
+      mockStellar.simulateContractCall.mockResolvedValue(onChainData);
+
+      await service.syncStatusFromChain(shipmentId);
+
+      // Should not attempt to update database
+      expect(mockPrisma.shipment.update).not.toHaveBeenCalled();
+    });
+
+    it('handles zero released amount correctly', async () => {
+      const onChainData = {
+        status: 'Active',
+        released_amount: '0',
+      };
+
+      mockStellar.simulateContractCall.mockResolvedValue(onChainData);
+      mockPrisma.shipment.update.mockResolvedValue({});
+
+      await service.syncStatusFromChain(shipmentId);
+
+      expect(mockPrisma.shipment.update).toHaveBeenCalledWith({
+        where: { id: shipmentId },
+        data: {
+          status: ShipmentStatus.ACTIVE,
+          releasedAmount: BigInt(0),
+        },
+      });
+    });
+
+    it('handles missing released_amount field', async () => {
+      const onChainData = {
+        status: 'Active',
+      };
+
+      mockStellar.simulateContractCall.mockResolvedValue(onChainData);
+      mockPrisma.shipment.update.mockResolvedValue({});
+
+      await service.syncStatusFromChain(shipmentId);
+
+      expect(mockPrisma.shipment.update).toHaveBeenCalledWith({
+        where: { id: shipmentId },
+        data: {
+          status: ShipmentStatus.ACTIVE,
+          releasedAmount: BigInt(0),
+        },
+      });
+    });
+
+    it('handles database not found error (P2025) gracefully', async () => {
+      const onChainData = {
+        status: 'Active',
+        released_amount: '1000000',
+      };
+
+      mockStellar.simulateContractCall.mockResolvedValue(onChainData);
+      mockPrisma.shipment.update.mockRejectedValue({
+        code: 'P2025',
+        message: 'Record not found',
+      });
+
+      // Should not throw
+      await expect(service.syncStatusFromChain(shipmentId)).resolves.not.toThrow();
+    });
+
+    it('handles contract call errors gracefully without throwing', async () => {
+      mockStellar.simulateContractCall.mockRejectedValue(
+        new Error('Contract simulation failed')
+      );
+
+      // Should not throw - errors are logged but not propagated
+      await expect(service.syncStatusFromChain(shipmentId)).resolves.not.toThrow();
+      
+      // Should not attempt to update database
+      expect(mockPrisma.shipment.update).not.toHaveBeenCalled();
+    });
+
+    it('handles database update errors gracefully without throwing', async () => {
+      const onChainData = {
+        status: 'Active',
+        released_amount: '1000000',
+      };
+
+      mockStellar.simulateContractCall.mockResolvedValue(onChainData);
+      mockPrisma.shipment.update.mockRejectedValue(
+        new Error('Database connection failed')
+      );
+
+      // Should not throw - errors are logged but not propagated
+      await expect(service.syncStatusFromChain(shipmentId)).resolves.not.toThrow();
+    });
+
+    it('handles BigInt conversion for large amounts', async () => {
+      const onChainData = {
+        status: 'Completed',
+        released_amount: '999999999999999',
+      };
+
+      mockStellar.simulateContractCall.mockResolvedValue(onChainData);
+      mockPrisma.shipment.update.mockResolvedValue({});
+
+      await service.syncStatusFromChain(shipmentId);
+
+      expect(mockPrisma.shipment.update).toHaveBeenCalledWith({
+        where: { id: shipmentId },
+        data: {
+          status: ShipmentStatus.COMPLETED,
+          releasedAmount: BigInt('999999999999999'),
+        },
+      });
     });
   });
 });
