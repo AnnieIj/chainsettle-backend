@@ -62,6 +62,8 @@ model User {
   id               String    @id @default(uuid())
   stellarAddress   String    @unique
   email            String?   @unique
+  emailVerified    Boolean   @default(false)
+  pendingEmail     String?
   name             String?
   role             UserRole  @default(BUYER)
   createdAt        DateTime  @default(now())

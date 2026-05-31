@@ -1,8 +1,11 @@
-import { Injectable, UnauthorizedException, Logger } from '@nestjs/common';
+import { Injectable, UnauthorizedException, ConflictException, Logger } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { RedisService } from '../../common/redis/redis.service';
 import { LoginDto } from './dto/login.dto';
+import { UpdateProfileDto } from './dto/update-profile.dto';
+import { NotificationsService } from '../notifications/notifications.service';
 
 /**
  * AuthService
@@ -29,6 +32,8 @@ export class AuthService {
     private readonly prisma: PrismaService,
     private readonly jwt: JwtService,
     private readonly redis: RedisService,
+    private readonly config: ConfigService,
+    private readonly notifications: NotificationsService,
   ) {}
 
   // ----------------------------------------------------------
@@ -90,5 +95,113 @@ export class AuthService {
 
     this.logger.log(`User authenticated: ${stellarAddress}`);
     return { accessToken, user };
+  }
+
+  async getProfile(userId: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        stellarAddress: true,
+        name: true,
+        email: true,
+        role: true,
+        createdAt: true,
+      },
+    });
+
+    if (!user) {
+      throw new UnauthorizedException('User not found');
+    }
+
+    return user;
+  }
+
+  async updateProfile(userId: string, dto: UpdateProfileDto) {
+    const user = await this.prisma.user.findUnique({ where: { id: userId } });
+
+    if (!user) {
+      throw new UnauthorizedException('User not found');
+    }
+
+    const updateData: any = {};
+
+    if (dto.name !== undefined) {
+      updateData.name = dto.name;
+    }
+
+    if (dto.email !== undefined && dto.email !== user.email) {
+      const existing = await this.prisma.user.findUnique({
+        where: { email: dto.email },
+      });
+
+      if (existing && existing.id !== userId) {
+        throw new ConflictException('Email is already in use');
+      }
+
+      const token = this.jwt.sign(
+        { sub: userId, email: dto.email },
+        { expiresIn: '24h' },
+      );
+
+      const verificationLink = `${this.config.get('API_BASE_URL', 'http://localhost:3000')}/api/v1/auth/verify-email?token=${token}`;
+
+      await this.notifications.sendEmail(
+        dto.email,
+        'Verify your email address',
+        `Click this link to verify your email: ${verificationLink}`,
+      );
+
+      updateData.pendingEmail = dto.email;
+    }
+
+    if (Object.keys(updateData).length > 0) {
+      await this.prisma.user.update({
+        where: { id: userId },
+        data: updateData,
+      });
+    }
+
+    return this.getProfile(userId);
+  }
+
+  async verifyEmail(token: string) {
+    let payload: { sub: string; email: string };
+    try {
+      payload = this.jwt.verify<{ sub: string; email: string }>(token);
+    } catch {
+      throw new UnauthorizedException('Invalid or expired verification token');
+    }
+
+    const user = await this.prisma.user.findUnique({
+      where: { id: payload.sub },
+    });
+
+    if (!user) {
+      throw new UnauthorizedException('User not found');
+    }
+
+    if (user.pendingEmail !== payload.email) {
+      throw new UnauthorizedException('Verification token does not match pending email');
+    }
+
+    const existing = await this.prisma.user.findUnique({
+      where: { email: payload.email },
+    });
+
+    if (existing && existing.id !== user.id) {
+      throw new ConflictException('Email is already in use');
+    }
+
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: {
+        email: payload.email,
+        emailVerified: true,
+        pendingEmail: null,
+      },
+    });
+
+    return { message: 'Email verified successfully' };
   }
 }

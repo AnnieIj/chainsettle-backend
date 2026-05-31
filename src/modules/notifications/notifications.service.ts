@@ -106,7 +106,7 @@ export class NotificationsService {
     });
   }
 
-  private async sendEmail(to: string, subject: string, text: string) {
+  async sendEmail(to: string, subject: string, text: string) {
     try {
       await this.transporter.sendMail({
         from: this.config.get('EMAIL_FROM', 'noreply@chainsetttle.com'),
