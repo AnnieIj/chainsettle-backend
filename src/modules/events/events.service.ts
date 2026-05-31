@@ -32,6 +32,7 @@ import { NotificationType } from '@prisma/client';
 @Injectable()
 export class EventsService implements OnModuleInit {
   private readonly logger = new Logger(EventsService.name);
+  /** In-memory mirror of the DB cursor — updated after each successful tick. */
   private lastProcessedLedger: number = 0;
 
   constructor(
@@ -44,14 +45,43 @@ export class EventsService implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
-    // Start polling from the current ledger minus a small buffer
     try {
-      const latest = await this.stellar.getLatestLedger();
-      this.lastProcessedLedger = Math.max(1, latest - 10);
-      this.logger.log(`Event poller initialised at ledger ${this.lastProcessedLedger}`);
+      // Attempt to load the persisted cursor from the database
+      const cursor = await this.prisma.eventCursor.findUnique({
+        where: { id: 'main' },
+      });
+
+      if (cursor) {
+        // Resume from where we left off
+        this.lastProcessedLedger = cursor.lastProcessedLedger;
+        this.logger.log(
+          `Resuming event poller from persisted ledger ${this.lastProcessedLedger}`,
+        );
+      } else {
+        // First-ever boot: seed from the current chain tip minus a small buffer
+        const latest = await this.stellar.getLatestLedger();
+        const seedLedger = Math.max(1, latest - 10);
+
+        await this.prisma.eventCursor.create({
+          data: { id: 'main', lastProcessedLedger: seedLedger },
+        });
+
+        this.lastProcessedLedger = seedLedger;
+        this.logger.log(
+          `Event cursor seeded at ledger ${this.lastProcessedLedger} (first boot)`,
+        );
+      }
     } catch (error) {
-      this.logger.warn('Could not fetch latest ledger on init — will retry on first poll');
-      this.lastProcessedLedger = 1;
+      this.logger.warn(
+        `Could not initialise event cursor from DB: ${error.message} — will retry on first poll`,
+      );
+      // Fall back to the Stellar chain tip so we don't replay the entire history
+      try {
+        const latest = await this.stellar.getLatestLedger();
+        this.lastProcessedLedger = Math.max(1, latest - 10);
+      } catch {
+        this.lastProcessedLedger = 1;
+      }
     }
   }
 
@@ -68,14 +98,28 @@ export class EventsService implements OnModuleInit {
 
       this.logger.log(`Processing ${events.length} new chain event(s)`);
 
-      for (const event of events) {
-        await this.processEvent(event);
-        // Advance the cursor past this event's ledger
-        this.lastProcessedLedger = Math.max(
-          this.lastProcessedLedger,
-          event.ledger + 1,
-        );
-      }
+      // Determine the new high-water mark before entering the transaction
+      const nextLedger = events.reduce(
+        (max, e) => Math.max(max, e.ledger + 1),
+        this.lastProcessedLedger,
+      );
+
+      // Process all events and advance the cursor in a single atomic transaction
+      await this.prisma.$transaction(async (tx) => {
+        for (const event of events) {
+          await this.processEvent(event, tx);
+        }
+
+        // Advance the durable cursor inside the same transaction
+        await tx.eventCursor.update({
+          where: { id: 'main' },
+          data: { lastProcessedLedger: nextLedger },
+        });
+      });
+
+      // Mirror the persisted value in memory
+      this.lastProcessedLedger = nextLedger;
+      this.logger.log(`Cursor advanced to ledger ${this.lastProcessedLedger}`);
     } catch (error) {
       this.logger.error('Event polling failed', error.message);
     }
@@ -85,14 +129,14 @@ export class EventsService implements OnModuleInit {
   // EVENT DISPATCHER
   // ----------------------------------------------------------
 
-  private async processEvent(event: any) {
+  private async processEvent(event: any, tx?: any) {
     const eventName = this.extractEventName(event);
     const payload = this.extractPayload(event);
 
     this.logger.debug(`Event: ${eventName} | Ledger: ${event.ledger}`);
 
-    // Save raw event to DB (audit trail)
-    await this.saveRawEvent(eventName, event, payload);
+    // Save raw event to DB (audit trail) — use the transaction client when provided
+    await this.saveRawEvent(eventName, event, payload, tx);
 
     // Route to the correct handler
     switch (eventName) {
@@ -315,12 +359,23 @@ export class EventsService implements OnModuleInit {
     }
   }
 
-  private async saveRawEvent(eventName: string, event: any, payload: any) {
+  private async saveRawEvent(eventName: string, event: any, payload: any, tx?: any) {
+    // Use the injected transaction client if one was provided, else fall back to
+    // the global PrismaService so non-transactional callers still work.
+    const client = tx ?? this.prisma;
     try {
       const shipmentId = this.extractShipmentId(payload);
 
-      await this.prisma.chainEvent.create({
-        data: {
+      await client.chainEvent.upsert({
+        where: {
+          // Idempotency: the same tx + event name should never be stored twice
+          txHash_eventName: {
+            txHash: event.txHash ?? '',
+            eventName,
+          },
+        },
+        update: {}, // already exists — no-op
+        create: {
           eventName,
           ledger: event.ledger ?? 0,
           txHash: event.txHash ?? '',

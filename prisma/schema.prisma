@@ -169,9 +169,11 @@ model ChainEvent {
   // Relations
   shipment Shipment? @relation(fields: [shipmentId], references: [id])
 
+  @@unique([txHash, eventName])
   @@index([shipmentId])
   @@index([eventName])
   @@index([processed])
+  @@index([ledger])
   @@map("chain_events")
 }
 
@@ -194,25 +196,17 @@ model Notification {
   @@map("notifications")
 }
 
-model AuditLog {
-  id             String   @id @default(uuid())
-  actorId        String?  // FK to User; null for system-initiated actions
-  actorAddress   String   // Stellar address for quick filtering
-  action         String   // e.g. 'shipment.sync', 'milestone.update'
-  resourceType   String   // e.g. 'Shipment', 'Milestone'
-  resourceId     String   // ID of the resource affected
-  metadata       Json?    // extra context (old values, new values, etc.)
-  ipAddress      String?  // IP address of the request
-  createdAt      DateTime @default(now())
+// ============================================================
+// LEDGER CURSOR (singleton row — key = 'main')
+// ============================================================
 
-  // Relations
-  actor User? @relation("AuditLogs", fields: [actorId], references: [id], onDelete: SetNull)
+// Persists the last successfully processed Stellar ledger sequence number.
+// A single row with id = 'main' acts as a singleton so the event poller
+// can resume from exactly the right point after any restart or crash.
+model EventCursor {
+  id                  String   @id // always 'main'
+  lastProcessedLedger Int
+  updatedAt           DateTime @updatedAt
 
-  @@index([actorId])
-  @@index([actorAddress])
-  @@index([action])
-  @@index([resourceType])
-  @@index([resourceId])
-  @@index([createdAt])
-  @@map("audit_logs")
+  @@map("event_cursors")
 }
