@@ -132,13 +132,49 @@ export class EventsService implements OnModuleInit {
 
   private async handleProofSubmitted(payload: any, event: any) {
     const [shipmentId, milestoneIndex] = Array.isArray(payload) ? payload : [payload, 0];
-    this.logger.log(`Proof submitted: ${shipmentId} milestone ${milestoneIndex}`);
+    this.logger.log(`Proof submitted on-chain: ${shipmentId} milestone ${milestoneIndex}`);
 
-    await this.milestones.markProofSubmitted(
-      String(shipmentId),
-      Number(milestoneIndex),
-      '', // proof hash is in the contract — fetch via simulateContractCall if needed
-    );
+    // Attempt to fetch the proof CID directly from the contract so the DB
+    // stays in sync regardless of whether the supplier called our API first.
+    let proofHash = '';
+    try {
+      const { nativeToScVal } = await import('@stellar/stellar-sdk');
+      const onChainProof = await this.stellar.simulateContractCall(
+        'get_milestone_proof',
+        [
+          nativeToScVal(String(shipmentId), { type: 'string' }),
+          nativeToScVal(Number(milestoneIndex), { type: 'u32' }),
+        ],
+      );
+      if (typeof onChainProof === 'string' && onChainProof.length > 0) {
+        proofHash = onChainProof;
+        this.logger.log(`Fetched on-chain proof CID: ${proofHash}`);
+      }
+    } catch (err) {
+      this.logger.warn(
+        `Could not fetch on-chain proof CID for ${shipmentId}[${milestoneIndex}]: ${err.message}`,
+      );
+    }
+
+    // Only update the DB if there is no existing CID stored (avoid overwriting
+    // a CID that the supplier already posted via the API endpoint).
+    const existing = await this.prisma.milestone.findUnique({
+      where: {
+        shipmentId_milestoneIndex: {
+          shipmentId: String(shipmentId),
+          milestoneIndex: Number(milestoneIndex),
+        },
+      },
+      select: { proofHash: true },
+    });
+
+    if (!existing?.proofHash || proofHash) {
+      await this.milestones.markProofSubmitted(
+        String(shipmentId),
+        Number(milestoneIndex),
+        proofHash || existing?.proofHash || '',
+      );
+    }
 
     const shipment = await this.prisma.shipment.findUnique({
       where: { id: String(shipmentId) },
@@ -148,9 +184,9 @@ export class EventsService implements OnModuleInit {
       await this.notifications.notifyUser(
         shipment.buyerAddress,
         NotificationType.PROOF_SUBMITTED,
-        'Proof submitted',
+        'Proof submitted for review',
         `Milestone ${milestoneIndex} proof has been submitted for shipment ${shipmentId}. Please review and confirm.`,
-        { shipmentId, milestoneIndex },
+        { shipmentId, milestoneIndex, proofHash },
       );
     }
   }
