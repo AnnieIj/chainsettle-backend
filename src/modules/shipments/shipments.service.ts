@@ -8,8 +8,10 @@ import {
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { StellarService } from '../../common/stellar/stellar.service';
 import { TokenRegistryService } from '../../common/token-registry/token-registry.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import { CreateShipmentDto } from './dto/create-shipment.dto';
-import { ShipmentStatus, UserRole } from '@prisma/client';
+import { ShipmentStatus, NotificationType, ArbiterStatus } from '@prisma/client';
+import { nativeToScVal } from '@stellar/stellar-sdk';
 
 
 @Injectable()
@@ -20,6 +22,7 @@ export class ShipmentsService {
     private readonly prisma: PrismaService,
     private readonly stellar: StellarService,
     private readonly tokenRegistry: TokenRegistryService,
+    private readonly notifications: NotificationsService,
   ) {}
 
   // ----------------------------------------------------------
@@ -79,7 +82,16 @@ export class ShipmentsService {
       include: { milestones: true },
     });
 
-    this.logger.log(`Shipment created: ${shipment.id}`);
+    // Notify the designated arbiter about their assignment
+    await this.notifications.notifyUser(
+      dto.arbiterAddress,
+      NotificationType.ARBITER_INVITED,
+      'Arbiter assignment invitation',
+      `You have been assigned as arbiter for shipment ${shipment.id}. Please accept or decline this assignment.`,
+      { shipmentId: shipment.id, buyerAddress: dto.buyerAddress, supplierAddress: dto.supplierAddress },
+    );
+
+    this.logger.log(`Shipment created: ${shipment.id} — arbiter ${dto.arbiterAddress} notified`);
     return this.serialize(shipment);
   }
 
@@ -102,6 +114,8 @@ export class ShipmentsService {
       buyerAddress,
       supplierAddress,
       status,
+      referenceNumber,
+      tags,
       page = 1,
       limit = 20,
       callerStellarAddress,
@@ -207,6 +221,90 @@ export class ShipmentsService {
     });
 
     this.logger.log(`Shipment updated: ${id}`);
+    return this.serialize(updated);
+  }
+
+  // ----------------------------------------------------------
+  // ARBITER ACCEPT / DECLINE
+  // ----------------------------------------------------------
+
+  /**
+   * Called when the designated arbiter accepts their assignment.
+   * Sets arbiterStatus to ACCEPTED and notifies the buyer.
+   */
+  async arbiterAccept(id: string, callerAddress: string) {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id },
+    });
+
+    if (!shipment) {
+      throw new NotFoundException(`Shipment ${id} not found`);
+    }
+
+    if (shipment.arbiterAddress !== callerAddress) {
+      throw new ForbiddenException('Only the designated arbiter can accept this assignment');
+    }
+
+    if (shipment.arbiterStatus !== ArbiterStatus.PENDING_ACCEPTANCE) {
+      throw new ConflictException(
+        `Arbiter assignment is already ${shipment.arbiterStatus.toLowerCase()}`,
+      );
+    }
+
+    const updated = await this.prisma.shipment.update({
+      where: { id },
+      data: { arbiterStatus: ArbiterStatus.ACCEPTED },
+    });
+
+    await this.notifications.notifyUser(
+      shipment.buyerAddress,
+      NotificationType.ARBITER_ACCEPTED,
+      'Arbiter accepted assignment',
+      `The arbiter for shipment ${id} has accepted their assignment.`,
+      { shipmentId: id, arbiterAddress: callerAddress },
+    );
+
+    this.logger.log(`Arbiter ${callerAddress} accepted assignment for shipment ${id}`);
+    return this.serialize(updated);
+  }
+
+  /**
+   * Called when the designated arbiter declines their assignment.
+   * Sets arbiterStatus to DECLINED and notifies the buyer.
+   */
+  async arbiterDecline(id: string, callerAddress: string) {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id },
+    });
+
+    if (!shipment) {
+      throw new NotFoundException(`Shipment ${id} not found`);
+    }
+
+    if (shipment.arbiterAddress !== callerAddress) {
+      throw new ForbiddenException('Only the designated arbiter can decline this assignment');
+    }
+
+    if (shipment.arbiterStatus !== ArbiterStatus.PENDING_ACCEPTANCE) {
+      throw new ConflictException(
+        `Arbiter assignment is already ${shipment.arbiterStatus.toLowerCase()}`,
+      );
+    }
+
+    const updated = await this.prisma.shipment.update({
+      where: { id },
+      data: { arbiterStatus: ArbiterStatus.DECLINED },
+    });
+
+    await this.notifications.notifyUser(
+      shipment.buyerAddress,
+      NotificationType.ARBITER_DECLINED,
+      'Arbiter declined assignment',
+      `The arbiter for shipment ${id} has declined their assignment. Please designate a replacement.`,
+      { shipmentId: id, arbiterAddress: callerAddress },
+    );
+
+    this.logger.log(`Arbiter ${callerAddress} declined assignment for shipment ${id}`);
     return this.serialize(updated);
   }
 
