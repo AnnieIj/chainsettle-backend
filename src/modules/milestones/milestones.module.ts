@@ -2,13 +2,13 @@
 import { Module } from '@nestjs/common';
 import { MilestonesController } from './milestones.controller';
 import { MilestonesService } from './milestones.service';
-import { IpfsModule } from '../../common/ipfs/ipfs.module';
+import { MilestoneDeadlineJob } from './milestone-deadline.job';
 import { NotificationsModule } from '../notifications/notifications.module';
 
 @Module({
-  imports: [IpfsModule, NotificationsModule],
+  imports: [NotificationsModule],
   controllers: [MilestonesController],
-  providers: [MilestonesService],
+  providers: [MilestonesService, MilestoneDeadlineJob],
   exports: [MilestonesService],
 })
 export class MilestonesModule {}

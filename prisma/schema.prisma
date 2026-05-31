@@ -35,8 +35,15 @@ enum NotificationType {
   MILESTONE_CONFIRMED
   DISPUTE_RAISED
   DISPUTE_RESOLVED
+  DISPUTE_EVIDENCE_SUBMITTED
   SHIPMENT_CANCELLED
   PAYMENT_RELEASED
+  MILESTONE_OVERDUE
+}
+
+enum DisputeRole {
+  BUYER
+  SUPPLIER
 }
 
 enum UserRole {
@@ -61,11 +68,13 @@ model User {
   updatedAt        DateTime  @updatedAt
 
   // Relations
-  buyerShipments     Shipment[]     @relation("BuyerShipments")
-  supplierShipments  Shipment[]     @relation("SupplierShipments")
-  logisticsShipments Shipment[]     @relation("LogisticsShipments")
-  arbiterShipments   Shipment[]     @relation("ArbiterShipments")
+  buyerShipments     Shipment[]        @relation("BuyerShipments")
+  supplierShipments  Shipment[]        @relation("SupplierShipments")
+  logisticsShipments Shipment[]        @relation("LogisticsShipments")
+  arbiterShipments   Shipment[]        @relation("ArbiterShipments")
   notifications      Notification[]
+  auditLogs          AuditLog[]     @relation("AuditLogs")
+  disputeEvidence    DisputeEvidence[]
 
   @@map("users")
 }
@@ -82,6 +91,13 @@ model Shipment {
   status           ShipmentStatus  @default(ACTIVE)
   txHash           String?         // ledger tx hash of creation
   createdLedger    Int?            // ledger sequence at creation
+
+  // Human-readable context fields
+  description      String?         // what goods are being shipped (max 1000 chars)
+  referenceNumber  String?         @unique // contract/PO reference for external systems
+  metadata         Json?           // arbitrary key-value pairs (incoterms, port, etc)
+  tags             String[]        @default([]) // searchable tags
+
   createdAt        DateTime        @default(now())
   updatedAt        DateTime        @updatedAt
 
@@ -97,23 +113,47 @@ model Shipment {
 }
 
 model Milestone {
-  id              String          @id @default(uuid())
-  shipmentId      String
-  milestoneIndex  Int             // 0-based index matching on-chain
-  name            String
-  paymentPercent  Int             // 0-100
-  proofHash       String?         // IPFS CID submitted by supplier/logistics
-  status          MilestoneStatus @default(PENDING)
-  paymentReleased BigInt?         // exact amount released for this milestone
-  confirmedAt     DateTime?
-  createdAt       DateTime        @default(now())
-  updatedAt       DateTime        @updatedAt
+  id                 String          @id @default(uuid())
+  shipmentId         String
+  milestoneIndex     Int             // 0-based index matching on-chain
+  name               String
+  paymentPercent     Int             // 0-100
+  proofHash          String?         // IPFS CID submitted by supplier/logistics
+  status             MilestoneStatus @default(PENDING)
+  paymentReleased    BigInt?         // exact amount released for this milestone
+  confirmedAt        DateTime?
+  dueAt              DateTime?       // optional deadline for milestone completion
+  overdueNotifiedAt  DateTime?       // timestamp when overdue notification was sent (prevents re-notification)
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
 
   // Relations
-  shipment Shipment @relation(fields: [shipmentId], references: [id])
+  shipment        Shipment          @relation(fields: [shipmentId], references: [id])
+  disputeEvidence DisputeEvidence[]
 
   @@unique([shipmentId, milestoneIndex])
   @@map("milestones")
+}
+
+model DisputeEvidence {
+  id          String      @id @default(uuid())
+  milestoneId String
+  submittedBy String      // Stellar address
+  role        DisputeRole // BUYER or SUPPLIER
+  description String      @db.Text
+  ipfsCid     String?     // IPFS hash of uploaded file
+  fileName    String?     // Original filename
+  fileSize    Int?        // File size in bytes
+  mimeType    String?     // MIME type of file
+  createdAt   DateTime    @default(now())
+
+  // Relations
+  milestone Milestone @relation(fields: [milestoneId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [submittedBy], references: [stellarAddress])
+
+  @@index([milestoneId])
+  @@index([submittedBy])
+  @@map("dispute_evidence")
 }
 
 model ChainEvent {
@@ -152,4 +192,27 @@ model Notification {
   @@index([userId])
   @@index([read])
   @@map("notifications")
+}
+
+model AuditLog {
+  id             String   @id @default(uuid())
+  actorId        String?  // FK to User; null for system-initiated actions
+  actorAddress   String   // Stellar address for quick filtering
+  action         String   // e.g. 'shipment.sync', 'milestone.update'
+  resourceType   String   // e.g. 'Shipment', 'Milestone'
+  resourceId     String   // ID of the resource affected
+  metadata       Json?    // extra context (old values, new values, etc.)
+  ipAddress      String?  // IP address of the request
+  createdAt      DateTime @default(now())
+
+  // Relations
+  actor User? @relation("AuditLogs", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([actorId])
+  @@index([actorAddress])
+  @@index([action])
+  @@index([resourceType])
+  @@index([resourceId])
+  @@index([createdAt])
+  @@map("audit_logs")
 }

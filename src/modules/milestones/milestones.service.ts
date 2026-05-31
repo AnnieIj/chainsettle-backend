@@ -1,14 +1,15 @@
 // milestones.service.ts
-import {
-  Injectable,
-  NotFoundException,
-  ForbiddenException,
-  Logger,
+import { 
+  Injectable, 
+  NotFoundException, 
+  Logger, 
+  ForbiddenException, 
+  ConflictException 
 } from '@nestjs/common';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { IpfsService } from '../../common/ipfs/ipfs.service';
 import { NotificationsService } from '../notifications/notifications.service';
-import { MilestoneStatus, NotificationType } from '@prisma/client';
+import { MilestoneStatus, NotificationType, DisputeRole } from '@prisma/client';
 
 @Injectable()
 export class MilestonesService {
@@ -179,5 +180,167 @@ export class MilestonesService {
           : {}),
       },
     });
+  }
+
+  /**
+   * Submit dispute evidence for a milestone
+   * Only buyer or supplier can submit when milestone is DISPUTED
+   */
+  async submitDisputeEvidence(
+    shipmentId: string,
+    milestoneIndex: number,
+    submittedBy: string,
+    description: string,
+    file?: Express.Multer.File,
+  ) {
+    // Get milestone and shipment
+    const milestone = await this.prisma.milestone.findUnique({
+      where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex } },
+      include: { shipment: true },
+    });
+
+    if (!milestone) {
+      throw new NotFoundException(
+        `Milestone ${milestoneIndex} not found on shipment ${shipmentId}`
+      );
+    }
+
+    // Check milestone status
+    if (milestone.status !== MilestoneStatus.DISPUTED) {
+      throw new ConflictException(
+        `Cannot submit evidence: milestone status is ${milestone.status}, must be DISPUTED`
+      );
+    }
+
+    // Determine role and check authorization
+    let role: DisputeRole;
+    if (submittedBy === milestone.shipment.buyerAddress) {
+      role = DisputeRole.BUYER;
+    } else if (submittedBy === milestone.shipment.supplierAddress) {
+      role = DisputeRole.SUPPLIER;
+    } else {
+      throw new ForbiddenException(
+        'Only the buyer or supplier can submit dispute evidence'
+      );
+    }
+
+    // Upload file to IPFS if provided
+    let ipfsCid: string | null = null;
+    let fileName: string | null = null;
+    let fileSize: number | null = null;
+    let mimeType: string | null = null;
+
+    if (file) {
+      try {
+        ipfsCid = await this.ipfs.uploadFile(file.buffer, file.originalname);
+        fileName = file.originalname;
+        fileSize = file.size;
+        mimeType = file.mimetype;
+        this.logger.log(
+          `Evidence file uploaded to IPFS: ${fileName} -> ${ipfsCid}`
+        );
+      } catch (error) {
+        this.logger.error('Failed to upload evidence to IPFS', error.message);
+        throw new Error('Failed to upload file to IPFS');
+      }
+    }
+
+    // Create evidence record
+    const evidence = await this.prisma.disputeEvidence.create({
+      data: {
+        milestoneId: milestone.id,
+        submittedBy,
+        role,
+        description,
+        ipfsCid,
+        fileName,
+        fileSize,
+        mimeType,
+      },
+    });
+
+    // Notify the arbiter
+    await this.notifications.notifyUser(
+      milestone.shipment.arbiterAddress,
+      NotificationType.DISPUTE_EVIDENCE_SUBMITTED,
+      'New Dispute Evidence Submitted',
+      `${role} has submitted evidence for milestone ${milestoneIndex} on shipment ${shipmentId}`,
+      {
+        shipmentId,
+        milestoneIndex,
+        evidenceId: evidence.id,
+        submittedBy,
+        role,
+      }
+    );
+
+    this.logger.log(
+      `Dispute evidence submitted: ${evidence.id} by ${role} for milestone ${milestoneIndex}`
+    );
+
+    return evidence;
+  }
+
+  /**
+   * Get all dispute evidence for a milestone
+   * Restricted to shipment participants and admins
+   */
+  async getDisputeEvidence(
+    shipmentId: string,
+    milestoneIndex: number,
+    requestedBy: string,
+  ) {
+    // Get milestone and shipment
+    const milestone = await this.prisma.milestone.findUnique({
+      where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex } },
+      include: { shipment: true },
+    });
+
+    if (!milestone) {
+      throw new NotFoundException(
+        `Milestone ${milestoneIndex} not found on shipment ${shipmentId}`
+      );
+    }
+
+    // Check authorization - must be a participant
+    const isParticipant = [
+      milestone.shipment.buyerAddress,
+      milestone.shipment.supplierAddress,
+      milestone.shipment.logisticsAddress,
+      milestone.shipment.arbiterAddress,
+    ].includes(requestedBy);
+
+    // Check if user is admin
+    const user = await this.prisma.user.findUnique({
+      where: { stellarAddress: requestedBy },
+    });
+
+    const isAdmin = user?.role === 'ADMIN';
+
+    if (!isParticipant && !isAdmin) {
+      throw new ForbiddenException(
+        'Only shipment participants can view dispute evidence'
+      );
+    }
+
+    // Get all evidence for this milestone
+    const evidence = await this.prisma.disputeEvidence.findMany({
+      where: { milestoneId: milestone.id },
+      orderBy: { createdAt: 'asc' },
+      include: {
+        user: {
+          select: {
+            stellarAddress: true,
+            name: true,
+          },
+        },
+      },
+    });
+
+    // Add IPFS gateway URLs
+    return evidence.map((item) => ({
+      ...item,
+      ipfsUrl: item.ipfsCid ? this.ipfs.getGatewayUrl(item.ipfsCid) : null,
+    }));
   }
 }

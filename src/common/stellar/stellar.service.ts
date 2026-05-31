@@ -85,7 +85,7 @@ export class StellarService implements OnModuleInit {
   ): Promise<SorobanRpc.Api.EventResponse[]> {
     try {
       const topicFilters = filters.length > 0
-        ? filters.map((f) => ({ topics: [f] }))
+        ? filters.map((f) => [f])
         : undefined;
 
       const result = await this.rpcClient.getEvents({
