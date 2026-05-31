@@ -29,6 +29,12 @@ enum MilestoneStatus {
   RESOLVED
 }
 
+enum ArbiterStatus {
+  PENDING_ACCEPTANCE
+  ACCEPTED
+  DECLINED
+}
+
 enum NotificationType {
   SHIPMENT_CREATED
   PROOF_SUBMITTED
@@ -41,6 +47,9 @@ enum NotificationType {
   MILESTONE_OVERDUE
   COMMENT_ADDED
   SYSTEM_ALERT
+  ARBITER_INVITED
+  ARBITER_ACCEPTED
+  ARBITER_DECLINED
 }
 
 enum CommentVisibility {
@@ -100,6 +109,7 @@ model Shipment {
   totalAmount      BigInt          // stored in stroops (smallest unit)
   releasedAmount   BigInt          @default(0)
   status           ShipmentStatus  @default(ACTIVE)
+  arbiterStatus    ArbiterStatus   @default(PENDING_ACCEPTANCE)
   txHash           String?         // ledger tx hash of creation
   createdLedger    Int?            // ledger sequence at creation
 
@@ -246,4 +256,21 @@ model ShipmentComment {
   @@index([shipmentId])
   @@index([authorId])
   @@map("shipment_comments")
+}
+
+model AuditLog {
+  id             String   @id @default(uuid())
+  userId         String
+  action         String
+  entityType     String
+  entityId       String?
+  metadata       Json?
+  ipAddress      String?
+  createdAt      DateTime @default(now())
+
+  user User @relation("AuditLogs", fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([entityType, entityId])
+  @@map("audit_logs")
 }

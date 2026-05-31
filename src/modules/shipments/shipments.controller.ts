@@ -81,6 +81,7 @@ export class ShipmentsController {
     // Ignore buyerAddress/supplierAddress filters for non-admin callers
     // to prevent listing other users' shipments.
     const isAdmin = user?.role === UserRole.ADMIN;
+    const tags = tagsQuery ? tagsQuery.split(',').map((t) => t.trim()).filter(Boolean) : undefined;
 
     return this.shipmentsService.findAll({
       buyerAddress: isAdmin ? buyerAddress : undefined,
@@ -124,6 +125,36 @@ export class ShipmentsController {
   @ApiResponse({ status: 409, description: 'Reference number already in use' })
   update(@Param('id') id: string, @Body() dto: UpdateShipmentDto, @CurrentUser() user: any) {
     return this.shipmentsService.update(id, user.stellarAddress, dto);
+  }
+
+  /**
+   * POST /api/v1/shipments/:id/arbiter/accept
+   * Designated arbiter accepts their assignment. Sets arbiterStatus to ACCEPTED
+   * and notifies the buyer.
+   */
+  @Post(':id/arbiter/accept')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Accept arbiter assignment for a shipment' })
+  @ApiResponse({ status: 200, description: 'Arbiter assignment accepted' })
+  @ApiResponse({ status: 403, description: 'Only the designated arbiter can accept' })
+  @ApiResponse({ status: 409, description: 'Assignment already resolved' })
+  arbiterAccept(@Param('id') id: string, @CurrentUser() user: any) {
+    return this.shipmentsService.arbiterAccept(id, user.stellarAddress);
+  }
+
+  /**
+   * POST /api/v1/shipments/:id/arbiter/decline
+   * Designated arbiter declines their assignment. Sets arbiterStatus to DECLINED
+   * and notifies the buyer.
+   */
+  @Post(':id/arbiter/decline')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Decline arbiter assignment for a shipment' })
+  @ApiResponse({ status: 200, description: 'Arbiter assignment declined' })
+  @ApiResponse({ status: 403, description: 'Only the designated arbiter can decline' })
+  @ApiResponse({ status: 409, description: 'Assignment already resolved' })
+  arbiterDecline(@Param('id') id: string, @CurrentUser() user: any) {
+    return this.shipmentsService.arbiterDecline(id, user.stellarAddress);
   }
 
   /**

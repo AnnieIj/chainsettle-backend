@@ -9,7 +9,7 @@ import {
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { IpfsService } from '../../common/ipfs/ipfs.service';
 import { NotificationsService } from '../notifications/notifications.service';
-import { MilestoneStatus, NotificationType, DisputeRole } from '@prisma/client';
+import { MilestoneStatus, NotificationType, DisputeRole, ArbiterStatus } from '@prisma/client';
 
 @Injectable()
 export class MilestonesService {
@@ -259,20 +259,26 @@ export class MilestonesService {
       },
     });
 
-    // Notify the arbiter
-    await this.notifications.notifyUser(
-      milestone.shipment.arbiterAddress,
-      NotificationType.DISPUTE_EVIDENCE_SUBMITTED,
-      'New Dispute Evidence Submitted',
-      `${role} has submitted evidence for milestone ${milestoneIndex} on shipment ${shipmentId}`,
-      {
-        shipmentId,
-        milestoneIndex,
-        evidenceId: evidence.id,
-        submittedBy,
-        role,
-      }
-    );
+    // Only notify the arbiter if they have accepted their assignment
+    if (milestone.shipment.arbiterStatus === ArbiterStatus.ACCEPTED) {
+      await this.notifications.notifyUser(
+        milestone.shipment.arbiterAddress,
+        NotificationType.DISPUTE_EVIDENCE_SUBMITTED,
+        'New Dispute Evidence Submitted',
+        `${role} has submitted evidence for milestone ${milestoneIndex} on shipment ${shipmentId}`,
+        {
+          shipmentId,
+          milestoneIndex,
+          evidenceId: evidence.id,
+          submittedBy,
+          role,
+        }
+      );
+    } else {
+      this.logger.warn(
+        `Arbiter ${milestone.shipment.arbiterAddress} has not accepted assignment for shipment ${shipmentId} — skipping notification`,
+      );
+    }
 
     this.logger.log(
       `Dispute evidence submitted: ${evidence.id} by ${role} for milestone ${milestoneIndex}`

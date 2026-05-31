@@ -4,7 +4,8 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { StellarService } from '../../common/stellar/stellar.service';
 import { TokenRegistryService } from '../../common/token-registry/token-registry.service';
 import { ConflictException, NotFoundException, ForbiddenException } from '@nestjs/common';
-import { ShipmentStatus } from '@prisma/client';
+import { ShipmentStatus, ArbiterStatus, NotificationType } from '@prisma/client';
+import { NotificationsService } from '../notifications/notifications.service';
 import { nativeToScVal } from '@stellar/stellar-sdk';
 
 const mockPrisma = {
@@ -28,6 +29,10 @@ const mockTokenRegistry = {
   getToken: jest.fn().mockReturnValue({ symbol: 'USDC', decimals: 7 }),
 };
 
+const mockNotifications = {
+  notifyUser: jest.fn().mockResolvedValue(undefined),
+};
+
 describe('ShipmentsService', () => {
   let service: ShipmentsService;
 
@@ -38,6 +43,7 @@ describe('ShipmentsService', () => {
         { provide: PrismaService, useValue: mockPrisma },
         { provide: StellarService, useValue: mockStellar },
         { provide: TokenRegistryService, useValue: mockTokenRegistry },
+        { provide: NotificationsService, useValue: mockNotifications },
       ],
     }).compile();
 
