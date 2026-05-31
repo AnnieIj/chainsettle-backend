@@ -9,7 +9,9 @@ import {
   UseGuards,
   HttpCode,
   HttpStatus,
+  ForbiddenException,
 } from '@nestjs/common';
+
 import {
   ApiTags,
   ApiOperation,
@@ -21,14 +23,16 @@ import { ShipmentsService } from './shipments.service';
 import { CreateShipmentDto, UpdateShipmentDto } from './dto/create-shipment.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
-import { ShipmentStatus } from '@prisma/client';
+import { ShipmentParticipantGuard } from './guards/shipment-participant.guard';
+import { ShipmentStatus, UserRole } from '@prisma/client';
+
 
 @ApiTags('shipments')
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard)
 @Controller('shipments')
 export class ShipmentsController {
-  constructor(private readonly shipmentsService: ShipmentsService) {}
+  constructor(private readonly shipmentsService: ShipmentsService) { }
 
   /**
    * POST /api/v1/shipments
@@ -41,8 +45,15 @@ export class ShipmentsController {
   @ApiOperation({ summary: 'Register a newly created on-chain shipment' })
   @ApiResponse({ status: 201, description: 'Shipment registered successfully' })
   create(@Body() dto: CreateShipmentDto, @CurrentUser() user: any) {
+    // POST /shipments remains open to any authenticated user,
+    // but buyerAddress must match the authenticated caller.
+    if (user?.role !== UserRole.ADMIN && dto.buyerAddress !== user?.stellarAddress) {
+      throw new ForbiddenException('buyerAddress must match the authenticated user');
+    }
+
     return this.shipmentsService.create(dto);
   }
+
 
   /**
    * GET /api/v1/shipments
@@ -58,6 +69,7 @@ export class ShipmentsController {
   @ApiQuery({ name: 'page', required: false, type: Number })
   @ApiQuery({ name: 'limit', required: false, type: Number })
   findAll(
+    @CurrentUser() user: any,
     @Query('buyerAddress') buyerAddress?: string,
     @Query('supplierAddress') supplierAddress?: string,
     @Query('status') status?: ShipmentStatus,
@@ -66,29 +78,38 @@ export class ShipmentsController {
     @Query('page') page?: number,
     @Query('limit') limit?: number,
   ) {
-    const tags = tagsQuery ? tagsQuery.split(',').map(t => t.trim()) : undefined;
+    // Ignore buyerAddress/supplierAddress filters for non-admin callers
+    // to prevent listing other users' shipments.
+    const isAdmin = user?.role === UserRole.ADMIN;
+
     return this.shipmentsService.findAll({
-      buyerAddress,
-      supplierAddress,
+      buyerAddress: isAdmin ? buyerAddress : undefined,
+      supplierAddress: isAdmin ? supplierAddress : undefined,
       status,
       referenceNumber,
       tags,
       page,
       limit,
+      callerStellarAddress: user?.stellarAddress,
+      isAdmin,
     });
   }
+
+
 
   /**
    * GET /api/v1/shipments/:id
    * Full shipment detail including milestones and recent on-chain events.
    */
   @Get(':id')
+  @UseGuards(ShipmentParticipantGuard)
   @ApiOperation({ summary: 'Get full shipment details including milestones and events' })
   @ApiResponse({ status: 200, description: 'Shipment found' })
   @ApiResponse({ status: 404, description: 'Shipment not found' })
   findOne(@Param('id') id: string) {
     return this.shipmentsService.findOne(id);
   }
+
 
   /**
    * PATCH /api/v1/shipments/:id
@@ -110,9 +131,11 @@ export class ShipmentsController {
    * Manually trigger a sync of the shipment state from the Stellar chain.
    */
   @Post(':id/sync')
+  @UseGuards(ShipmentParticipantGuard)
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Force sync shipment status from Stellar chain' })
   sync(@Param('id') id: string) {
     return this.shipmentsService.syncStatusFromChain(id);
   }
+
 }

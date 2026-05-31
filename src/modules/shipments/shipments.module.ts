@@ -11,4 +11,6 @@ import { NotificationsModule } from '../notifications/notifications.module';
   providers: [ShipmentsService, CommentsService],
   exports: [ShipmentsService],
 })
-export class ShipmentsModule {}
+export class ShipmentsModule { }
+
+

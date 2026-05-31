@@ -1,8 +1,9 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as nodemailer from 'nodemailer';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { NotificationType } from '@prisma/client';
+import { NotificationsGateway } from './notifications.gateway';
 
 @Injectable()
 export class NotificationsService {
@@ -12,6 +13,7 @@ export class NotificationsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
+    @Optional() private readonly gateway: NotificationsGateway,
   ) {
     this.transporter = nodemailer.createTransport({
       host: this.config.get('SMTP_HOST'),
@@ -63,6 +65,9 @@ export class NotificationsService {
           data: { emailSent: true },
         });
       }
+
+      // Push to any connected WebSocket clients for this user
+      this.gateway?.pushToUser(user.id, notification);
 
       return notification;
     } catch (error) {

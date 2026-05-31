@@ -26,6 +26,7 @@ const MAX_ATTEMPTS = 5;
 @Injectable()
 export class EventsService implements OnModuleInit {
   private readonly logger = new Logger(EventsService.name);
+  /** In-memory mirror of the DB cursor — updated after each successful tick. */
   private lastProcessedLedger: number = 0;
 
   constructor(
@@ -39,12 +40,42 @@ export class EventsService implements OnModuleInit {
 
   async onModuleInit() {
     try {
-      const latest = await this.stellar.getLatestLedger();
-      this.lastProcessedLedger = Math.max(1, latest - 10);
-      this.logger.log(`Event poller initialised at ledger ${this.lastProcessedLedger}`);
+      // Attempt to load the persisted cursor from the database
+      const cursor = await this.prisma.eventCursor.findUnique({
+        where: { id: 'main' },
+      });
+
+      if (cursor) {
+        // Resume from where we left off
+        this.lastProcessedLedger = cursor.lastProcessedLedger;
+        this.logger.log(
+          `Resuming event poller from persisted ledger ${this.lastProcessedLedger}`,
+        );
+      } else {
+        // First-ever boot: seed from the current chain tip minus a small buffer
+        const latest = await this.stellar.getLatestLedger();
+        const seedLedger = Math.max(1, latest - 10);
+
+        await this.prisma.eventCursor.create({
+          data: { id: 'main', lastProcessedLedger: seedLedger },
+        });
+
+        this.lastProcessedLedger = seedLedger;
+        this.logger.log(
+          `Event cursor seeded at ledger ${this.lastProcessedLedger} (first boot)`,
+        );
+      }
     } catch (error) {
-      this.logger.warn('Could not fetch latest ledger on init — will retry on first poll');
-      this.lastProcessedLedger = 1;
+      this.logger.warn(
+        `Could not initialise event cursor from DB: ${error.message} — will retry on first poll`,
+      );
+      // Fall back to the Stellar chain tip so we don't replay the entire history
+      try {
+        const latest = await this.stellar.getLatestLedger();
+        this.lastProcessedLedger = Math.max(1, latest - 10);
+      } catch {
+        this.lastProcessedLedger = 1;
+      }
     }
   }
 
@@ -131,7 +162,7 @@ export class EventsService implements OnModuleInit {
   // EVENT DISPATCHER
   // ----------------------------------------------------------
 
-  private async processEvent(event: any) {
+  private async processEvent(event: any, tx?: any) {
     const eventName = this.extractEventName(event);
     const payload = this.extractPayload(event);
 
@@ -178,7 +209,7 @@ export class EventsService implements OnModuleInit {
 
   private async handleProofSubmitted(payload: any, event: any) {
     const [shipmentId, milestoneIndex] = Array.isArray(payload) ? payload : [payload, 0];
-    this.logger.log(`Proof submitted: ${shipmentId} milestone ${milestoneIndex}`);
+    this.logger.log(`Proof submitted on-chain: ${shipmentId} milestone ${milestoneIndex}`);
 
     await this.milestones.markProofSubmitted(
       String(shipmentId),
@@ -194,9 +225,9 @@ export class EventsService implements OnModuleInit {
       await this.notifications.notifyUser(
         shipment.buyerAddress,
         NotificationType.PROOF_SUBMITTED,
-        'Proof submitted',
+        'Proof submitted for review',
         `Milestone ${milestoneIndex} proof has been submitted for shipment ${shipmentId}. Please review and confirm.`,
-        { shipmentId, milestoneIndex },
+        { shipmentId, milestoneIndex, proofHash },
       );
     }
   }
@@ -436,12 +467,23 @@ export class EventsService implements OnModuleInit {
     }
   }
 
-  private async saveRawEvent(eventName: string, event: any, payload: any) {
+  private async saveRawEvent(eventName: string, event: any, payload: any, tx?: any) {
+    // Use the injected transaction client if one was provided, else fall back to
+    // the global PrismaService so non-transactional callers still work.
+    const client = tx ?? this.prisma;
     try {
       const shipmentId = this.extractShipmentId(payload);
 
-      await this.prisma.chainEvent.create({
-        data: {
+      await client.chainEvent.upsert({
+        where: {
+          // Idempotency: the same tx + event name should never be stored twice
+          txHash_eventName: {
+            txHash: event.txHash ?? '',
+            eventName,
+          },
+        },
+        update: {}, // already exists — no-op
+        create: {
           eventName,
           ledger: event.ledger ?? 0,
           txHash: event.txHash ?? '',

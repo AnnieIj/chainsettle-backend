@@ -1,93 +1,96 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, InternalServerErrorException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { create, IPFSHTTPClient } from 'ipfs-http-client';
+import axios from 'axios';
+import * as FormData from 'form-data';
 
 /**
- * IPFS Service for uploading and retrieving files
- * Used for dispute evidence and milestone proof documents
+ * IpfsService
+ *
+ * Uploads files to IPFS via Pinata's pinning API.
+ * Falls back gracefully if keys are not configured (useful in development).
+ *
+ * Environment variables:
+ *   IPFS_GATEWAY_URL  — Public read gateway, e.g. https://gateway.pinata.cloud/ipfs
+ *   IPFS_API_KEY      — Pinata API key (JWT or v2 key)
  */
 @Injectable()
 export class IpfsService {
   private readonly logger = new Logger(IpfsService.name);
-  private client: IPFSHTTPClient;
+  private readonly pinataUrl = 'https://api.pinata.cloud/pinning/pinFileToIPFS';
+  private readonly gateway: string;
+  private readonly apiKey: string;
 
   constructor(private readonly config: ConfigService) {
-    const ipfsUrl = this.config.get<string>('IPFS_API_URL', 'http://localhost:5001');
-    
-    try {
-      this.client = create({ url: ipfsUrl });
-      this.logger.log(`IPFS client connected to ${ipfsUrl}`);
-    } catch (error) {
-      this.logger.error('Failed to initialize IPFS client', error.message);
-    }
+    this.gateway = this.config.get<string>(
+      'IPFS_GATEWAY_URL',
+      'https://gateway.pinata.cloud/ipfs',
+    );
+    this.apiKey = this.config.get<string>('IPFS_API_KEY', '');
   }
 
   /**
-   * Upload a file to IPFS
-   * @param buffer File buffer
-   * @param filename Original filename
-   * @returns IPFS CID (Content Identifier)
+   * Uploads a file buffer to IPFS via Pinata.
+   *
+   * @param fileBuffer  - Raw file bytes
+   * @param originalName - Original filename (for Pinata metadata)
+   * @param mimeType    - MIME type of the file
+   * @returns The IPFS CID (v1, base32 encoded)
+   * @throws InternalServerErrorException on upload failure
    */
-  async uploadFile(buffer: Buffer, filename: string): Promise<string> {
+  async uploadFile(
+    fileBuffer: Buffer,
+    originalName: string,
+    mimeType: string,
+  ): Promise<string> {
+    if (!this.apiKey) {
+      this.logger.warn(
+        'IPFS_API_KEY not configured — returning stub CID for development',
+      );
+      return `bafydev${Buffer.from(originalName).toString('hex').slice(0, 52)}`;
+    }
+
     try {
-      const result = await this.client.add(
+      const form = new FormData();
+      form.append('file', fileBuffer, {
+        filename: originalName,
+        contentType: mimeType,
+      });
+
+      // Optional metadata for Pinata dashboard
+      const pinataMetadata = JSON.stringify({ name: originalName });
+      form.append('pinataMetadata', pinataMetadata);
+
+      const response = await axios.post<{ IpfsHash: string }>(
+        this.pinataUrl,
+        form,
         {
-          path: filename,
-          content: buffer,
+          headers: {
+            Authorization: `Bearer ${this.apiKey}`,
+            ...form.getHeaders(),
+          },
+          maxBodyLength: Infinity,
+          timeout: 60_000,
         },
-        {
-          pin: true, // Pin the file to prevent garbage collection
-        }
       );
 
-      this.logger.log(`File uploaded to IPFS: ${filename} -> ${result.cid.toString()}`);
-      return result.cid.toString();
+      const cid = response.data.IpfsHash;
+      this.logger.log(`File pinned to IPFS: ${cid} (${originalName})`);
+      return cid;
     } catch (error) {
-      this.logger.error(`Failed to upload file to IPFS: ${filename}`, error.message);
-      throw new Error(`IPFS upload failed: ${error.message}`);
+      const detail = error.response?.data?.error?.details ?? error.message;
+      this.logger.error(`Failed to pin file to IPFS`, detail);
+      throw new InternalServerErrorException(
+        `IPFS upload failed: ${detail}`,
+      );
     }
   }
 
   /**
-   * Get IPFS gateway URL for a CID
-   * @param cid IPFS Content Identifier
-   * @returns Public gateway URL
+   * Returns the full public gateway URL for a given CID.
+   *
+   * @example getGatewayUrl('bafybeig...') → 'https://gateway.pinata.cloud/ipfs/bafybeig...'
    */
   getGatewayUrl(cid: string): string {
-    const gateway = this.config.get<string>('IPFS_GATEWAY_URL', 'https://ipfs.io/ipfs');
-    return `${gateway}/${cid}`;
-  }
-
-  /**
-   * Retrieve file content from IPFS
-   * @param cid IPFS Content Identifier
-   * @returns File buffer
-   */
-  async getFile(cid: string): Promise<Buffer> {
-    try {
-      const chunks: Uint8Array[] = [];
-      
-      for await (const chunk of this.client.cat(cid)) {
-        chunks.push(chunk);
-      }
-
-      return Buffer.concat(chunks);
-    } catch (error) {
-      this.logger.error(`Failed to retrieve file from IPFS: ${cid}`, error.message);
-      throw new Error(`IPFS retrieval failed: ${error.message}`);
-    }
-  }
-
-  /**
-   * Check if IPFS client is available
-   */
-  async isAvailable(): Promise<boolean> {
-    try {
-      await this.client.id();
-      return true;
-    } catch (error) {
-      this.logger.warn('IPFS client not available', error.message);
-      return false;
-    }
+    return `${this.gateway}/${cid}`;
   }
 }

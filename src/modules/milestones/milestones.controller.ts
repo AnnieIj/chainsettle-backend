@@ -1,28 +1,43 @@
-import { 
-  Controller, 
-  Get, 
+import {
+  Controller,
+  Get,
   Post,
-  Param, 
-  ParseIntPipe, 
+  Param,
+  ParseIntPipe,
   UseGuards,
   UseInterceptors,
   UploadedFile,
-  Body,
+  BadRequestException,
   HttpCode,
   HttpStatus,
 } from '@nestjs/common';
-import { 
-  ApiTags, 
-  ApiOperation, 
-  ApiBearerAuth, 
+import { FileInterceptor } from '@nestjs/platform-express';
+import {
+  ApiTags,
+  ApiOperation,
+  ApiBearerAuth,
   ApiConsumes,
+  ApiBody,
   ApiResponse,
 } from '@nestjs/swagger';
-import { FileInterceptor } from '@nestjs/platform-express';
+import { memoryStorage } from 'multer';
 import { MilestonesService } from './milestones.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
-import { SubmitDisputeEvidenceDto } from './dto/submit-dispute-evidence.dto';
+
+/** Maximum allowed proof file size: 50 MB */
+const MAX_FILE_SIZE = 50 * 1024 * 1024;
+
+/** Accepted MIME types for proof documents */
+const ALLOWED_MIME_TYPES = [
+  'application/pdf',
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/gif',
+  'video/mp4',
+  'video/quicktime',
+];
 
 @ApiTags('milestones')
 @ApiBearerAuth()
@@ -46,55 +61,97 @@ export class MilestonesController {
     return this.milestonesService.findOne(shipmentId, index);
   }
 
-  @Post(':index/dispute-evidence')
+  /**
+   * POST /api/v1/shipments/:shipmentId/milestones/:index/proof
+   *
+   * Accepts a multipart/form-data upload with a "file" field containing
+   * the proof document. Pins it to IPFS via Pinata, stores the resulting
+   * CID in the database, and notifies the buyer.
+   *
+   * Restricted to the shipment's supplierAddress or logisticsAddress.
+   */
+  @Post(':index/proof')
   @HttpCode(HttpStatus.CREATED)
-  @UseInterceptors(FileInterceptor('file', {
-    limits: {
-      fileSize: 10 * 1024 * 1024, // 10MB max
-    },
-  }))
-  @ApiConsumes('multipart/form-data')
-  @ApiOperation({ 
-    summary: 'Submit dispute evidence for a milestone',
-    description: 'Only buyer or supplier can submit evidence when milestone is DISPUTED. Supports optional file upload (max 10MB).',
+  @ApiOperation({
+    summary: 'Submit proof of delivery for a milestone',
+    description:
+      'Pins the uploaded file to IPFS (via Pinata) and stores the CID in the milestone record. ' +
+      'Only the shipment\'s supplierAddress or logisticsAddress may call this endpoint.',
   })
-  @ApiResponse({ status: 201, description: 'Evidence submitted successfully' })
-  @ApiResponse({ status: 403, description: 'Not authorized to submit evidence' })
-  @ApiResponse({ status: 404, description: 'Milestone not found' })
-  @ApiResponse({ status: 409, description: 'Milestone is not in DISPUTED status or already resolved' })
-  async submitDisputeEvidence(
+  @ApiConsumes('multipart/form-data')
+  @ApiBody({
+    schema: {
+      type: 'object',
+      required: ['file'],
+      properties: {
+        file: {
+          type: 'string',
+          format: 'binary',
+          description:
+            'Proof document (PDF, image, or video). Maximum 50 MB.',
+        },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 201,
+    description: 'Proof pinned to IPFS and milestone updated',
+    schema: {
+      example: {
+        milestone: {
+          id: 'uuid',
+          shipmentId: 'ship-001',
+          milestoneIndex: 0,
+          status: 'PROOF_SUBMITTED',
+          proofHash: 'bafybeig...',
+        },
+        cid: 'bafybeig...',
+        gatewayUrl: 'https://gateway.pinata.cloud/ipfs/bafybeig...',
+      },
+    },
+  })
+  @ApiResponse({ status: 400, description: 'No file uploaded or invalid type' })
+  @ApiResponse({ status: 403, description: 'Caller is not the supplier or logistics provider' })
+  @ApiResponse({ status: 404, description: 'Shipment or milestone not found' })
+  @UseInterceptors(
+    FileInterceptor('file', {
+      storage: memoryStorage(),
+      limits: { fileSize: MAX_FILE_SIZE },
+      fileFilter(
+        _req,
+        file: Express.Multer.File,
+        callback: (error: Error | null, acceptFile: boolean) => void,
+      ) {
+        if (!ALLOWED_MIME_TYPES.includes(file.mimetype)) {
+          return callback(
+            new BadRequestException(
+              `Unsupported file type: ${file.mimetype}. Allowed: PDF, images, MP4.`,
+            ),
+            false,
+          );
+        }
+        callback(null, true);
+      },
+    }),
+  )
+  async submitProof(
     @Param('shipmentId') shipmentId: string,
     @Param('index', ParseIntPipe) index: number,
-    @Body() dto: SubmitDisputeEvidenceDto,
     @UploadedFile() file: Express.Multer.File,
     @CurrentUser() user: any,
   ) {
-    return this.milestonesService.submitDisputeEvidence(
-      shipmentId,
-      index,
-      user.stellarAddress,
-      dto.description,
-      file,
-    );
-  }
+    if (!file) {
+      throw new BadRequestException('A proof file must be provided in the "file" field');
+    }
 
-  @Get(':index/dispute-evidence')
-  @ApiOperation({ 
-    summary: 'Get all dispute evidence for a milestone',
-    description: 'Restricted to shipment participants (buyer, supplier, logistics, arbiter) and admins.',
-  })
-  @ApiResponse({ status: 200, description: 'Evidence list retrieved successfully' })
-  @ApiResponse({ status: 403, description: 'Not authorized to view evidence' })
-  @ApiResponse({ status: 404, description: 'Milestone not found' })
-  async getDisputeEvidence(
-    @Param('shipmentId') shipmentId: string,
-    @Param('index', ParseIntPipe) index: number,
-    @CurrentUser() user: any,
-  ) {
-    return this.milestonesService.getDisputeEvidence(
+    // The JWT payload carries the Stellar address as `sub` or `stellarAddress`
+    const callerAddress: string = user?.stellarAddress ?? user?.sub;
+
+    return this.milestonesService.submitProof(
       shipmentId,
       index,
-      user.stellarAddress,
+      callerAddress,
+      file,
     );
   }
 }

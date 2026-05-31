@@ -3,7 +3,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { ScheduleModule } from '@nestjs/schedule';
 import { TerminusModule } from '@nestjs/terminus';
-import { APP_GUARD } from '@nestjs/core';
+import { APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 
 import { PrismaModule } from './common/prisma/prisma.module';
 import { StellarModule } from './common/stellar/stellar.module';
@@ -18,6 +18,8 @@ import { MilestonesModule } from './modules/milestones/milestones.module';
 import { EventsModule } from './modules/events/events.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
 import { HealthModule } from './modules/health/health.module';
+import { AuditLogsModule } from './modules/audit-logs/audit-logs.module';
+import { AuditLogInterceptor } from './modules/audit-logs/audit-log.interceptor';
 
 @Module({
   imports: [
@@ -63,12 +65,18 @@ import { HealthModule } from './modules/health/health.module';
     EventsModule,
     NotificationsModule,
     HealthModule,
+    AuditLogsModule,
   ],
   providers: [
     // Apply global throttler guard (can be overridden per route)
     {
       provide: APP_GUARD,
       useClass: ThrottlerGuard,
+    },
+    // Apply global audit logging interceptor (logs all mutations)
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: AuditLogInterceptor,
     },
   ],
 })

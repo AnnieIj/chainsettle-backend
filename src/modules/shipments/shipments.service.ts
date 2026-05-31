@@ -9,8 +9,8 @@ import { PrismaService } from '../../common/prisma/prisma.service';
 import { StellarService } from '../../common/stellar/stellar.service';
 import { TokenRegistryService } from '../../common/token-registry/token-registry.service';
 import { CreateShipmentDto } from './dto/create-shipment.dto';
-import { ShipmentStatus } from '@prisma/client';
-import { nativeToScVal } from '@stellar/stellar-sdk';
+import { ShipmentStatus, UserRole } from '@prisma/client';
+
 
 @Injectable()
 export class ShipmentsService {
@@ -95,16 +95,40 @@ export class ShipmentsService {
     tags?: string[];
     page?: number;
     limit?: number;
+    callerStellarAddress?: string;
+    isAdmin?: boolean;
   }) {
-    const { buyerAddress, supplierAddress, status, referenceNumber, tags, page = 1, limit = 20 } = filters;
+    const {
+      buyerAddress,
+      supplierAddress,
+      status,
+      page = 1,
+      limit = 20,
+      callerStellarAddress,
+      isAdmin = false,
+    } = filters;
 
     const where: any = {};
+
     if (buyerAddress) where.buyerAddress = buyerAddress;
     if (supplierAddress) where.supplierAddress = supplierAddress;
     if (status) where.status = status;
     if (referenceNumber) where.referenceNumber = referenceNumber;
     if (tags && tags.length > 0) {
       where.tags = { hasSome: tags };
+    }
+
+    // Scope to shipments where the caller is a participant (buyer/supplier/logistics/arbiter)
+    if (!isAdmin && callerStellarAddress) {
+      where.AND = where.AND ?? [];
+      where.AND.push({
+        OR: [
+          { buyerAddress: callerStellarAddress },
+          { supplierAddress: callerStellarAddress },
+          { logisticsAddress: callerStellarAddress },
+          { arbiterAddress: callerStellarAddress },
+        ],
+      });
     }
 
     const [shipments, total] = await this.prisma.$transaction([
@@ -123,6 +147,7 @@ export class ShipmentsService {
       meta: { total, page, limit, totalPages: Math.ceil(total / limit) },
     };
   }
+
 
   async findOne(id: string) {
     const shipment = await this.prisma.shipment.findUnique({

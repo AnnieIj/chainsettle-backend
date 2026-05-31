@@ -81,6 +81,7 @@ model User {
   logisticsShipments Shipment[]        @relation("LogisticsShipments")
   arbiterShipments   Shipment[]        @relation("ArbiterShipments")
   notifications      Notification[]
+  auditLogs          AuditLog[]     @relation("AuditLogs")
   disputeEvidence    DisputeEvidence[]
   comments           ShipmentComment[]
 
@@ -182,9 +183,11 @@ model ChainEvent {
   // Relations
   shipment Shipment? @relation(fields: [shipmentId], references: [id])
 
+  @@unique([txHash, eventName])
   @@index([shipmentId])
   @@index([eventName])
   @@index([processed])
+  @@index([ledger])
   @@map("chain_events")
 }
 

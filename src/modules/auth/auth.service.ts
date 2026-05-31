@@ -1,5 +1,6 @@
 import { Injectable, UnauthorizedException, Logger } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
+import { Keypair } from '@stellar/stellar-sdk';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { RedisService } from '../../common/redis/redis.service';
 import { LoginDto } from './dto/login.dto';
@@ -17,31 +18,32 @@ import { LoginDto } from './dto/login.dto';
  * The Stellar address IS the identity.
  *
  * NOTE: Full signature verification requires the Stellar SDK's keypair.verify().
- * The verify() call is stubbed below — wire it up with the actual SDK call.
  */
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
-  private readonly NONCE_PREFIX = 'nonce:';
-  private readonly NONCE_TTL = 5 * 60; // 5 minutes in seconds
+  private readonly NONCE_PREFIX = 'chainsettle:nonce:';
+  private readonly NONCE_TTL_MS = 5 * 60 * 1000; // 5 minutes in milliseconds
+
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwt: JwtService,
     private readonly redis: RedisService,
-  ) {}
+  ) { }
 
   // ----------------------------------------------------------
   // STEP 1: Generate a challenge nonce for an address
   // ----------------------------------------------------------
 
   async generateNonce(stellarAddress: string): Promise<string> {
-    const nonce = `chainsetttle:${stellarAddress}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    const nonce = `chainsettle:${stellarAddress}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
     const key = `${this.NONCE_PREFIX}${stellarAddress}`;
-    
-    // Store in Redis with 5-minute expiration
-    await this.redis.set(key, nonce, this.NONCE_TTL);
-    
+
+    // Store in Redis with 5-minute expiration using Redis-native TTL
+    await this.redis.setPx(key, nonce, this.NONCE_TTL_MS);
+
+
     return nonce;
   }
 
@@ -55,17 +57,22 @@ export class AuthService {
     // Retrieve the stored nonce from Redis
     const key = `${this.NONCE_PREFIX}${stellarAddress}`;
     const storedNonce = await this.redis.get(key);
-    
+
+
     if (!storedNonce) {
       throw new UnauthorizedException('Nonce expired or not found. Request a new one.');
     }
 
-    // Verify the signature
-    // TODO: wire up actual Stellar keypair.verify() call
-    // const keypair = Keypair.fromPublicKey(stellarAddress);
-    // const isValid = keypair.verify(Buffer.from(storedNonce), Buffer.from(signature, 'base64'));
-    // if (!isValid) throw new UnauthorizedException('Invalid signature');
-    const isValid = true; // STUB — replace before production
+    // Verify the signature against the stored nonce.
+    let isValid = false;
+    try {
+      const keypair = Keypair.fromPublicKey(stellarAddress);
+      const signatureBuffer = Buffer.from(signature, 'base64');
+      isValid = keypair.verify(Buffer.from(storedNonce), signatureBuffer);
+    } catch (err) {
+      this.logger.warn(`Signature verification failed for ${stellarAddress}`);
+      throw new UnauthorizedException('Signature verification failed');
+    }
 
     if (!isValid) {
       throw new UnauthorizedException('Signature verification failed');
