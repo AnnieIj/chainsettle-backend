@@ -3,11 +3,13 @@ import {
   NotFoundException,
   Logger,
   ConflictException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { StellarService } from '../../common/stellar/stellar.service';
 import { CreateShipmentDto } from './dto/create-shipment.dto';
 import { ShipmentStatus } from '@prisma/client';
+import { nativeToScVal } from '@stellar/stellar-sdk';
 
 @Injectable()
 export class ShipmentsService {
@@ -35,6 +37,16 @@ export class ShipmentsService {
       throw new ConflictException(`Shipment ${dto.shipmentId} already exists`);
     }
 
+    // Check for duplicate referenceNumber if provided
+    if (dto.referenceNumber) {
+      const withRef = await this.prisma.shipment.findUnique({
+        where: { referenceNumber: dto.referenceNumber },
+      });
+      if (withRef) {
+        throw new ConflictException(`Shipment with referenceNumber "${dto.referenceNumber}" already exists`);
+      }
+    }
+
     const shipment = await this.prisma.shipment.create({
       data: {
         id: dto.shipmentId,
@@ -45,11 +57,16 @@ export class ShipmentsService {
         tokenAddress: dto.tokenAddress,
         totalAmount: BigInt(dto.totalAmount),
         txHash: dto.txHash,
+        description: dto.description,
+        referenceNumber: dto.referenceNumber,
+        metadata: dto.metadata,
+        tags: dto.tags ?? [],
         milestones: {
           create: dto.milestones.map((m, index) => ({
             milestoneIndex: index,
             name: m.name,
             paymentPercent: m.paymentPercent,
+            ...(m.dueAt ? { dueAt: new Date(m.dueAt) } : {}),
           })),
         },
       },
@@ -68,15 +85,21 @@ export class ShipmentsService {
     buyerAddress?: string;
     supplierAddress?: string;
     status?: ShipmentStatus;
+    referenceNumber?: string;
+    tags?: string[];
     page?: number;
     limit?: number;
   }) {
-    const { buyerAddress, supplierAddress, status, page = 1, limit = 20 } = filters;
+    const { buyerAddress, supplierAddress, status, referenceNumber, tags, page = 1, limit = 20 } = filters;
 
     const where: any = {};
     if (buyerAddress) where.buyerAddress = buyerAddress;
     if (supplierAddress) where.supplierAddress = supplierAddress;
     if (status) where.status = status;
+    if (referenceNumber) where.referenceNumber = referenceNumber;
+    if (tags && tags.length > 0) {
+      where.tags = { hasSome: tags };
+    }
 
     const [shipments, total] = await this.prisma.$transaction([
       this.prisma.shipment.findMany({
@@ -107,18 +130,75 @@ export class ShipmentsService {
     return this.serialize(shipment);
   }
 
+  /**
+   * Update shipment metadata (description, referenceNumber, metadata, tags).
+   * Only the buyer can update a shipment.
+   * Financial fields and addresses are immutable and ignored if provided.
+   */
+  async update(id: string, buyerAddress: string, dto: any) {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id },
+    });
+
+    if (!shipment) {
+      throw new NotFoundException(`Shipment ${id} not found`);
+    }
+
+    // Verify buyer is the one making the update
+    if (shipment.buyerAddress !== buyerAddress) {
+      throw new ForbiddenException('Only the shipment buyer can update it');
+    }
+
+    // Check for duplicate referenceNumber if being updated
+    if (dto.referenceNumber && dto.referenceNumber !== shipment.referenceNumber) {
+      const withRef = await this.prisma.shipment.findUnique({
+        where: { referenceNumber: dto.referenceNumber },
+      });
+      if (withRef) {
+        throw new ConflictException(`Shipment with referenceNumber "${dto.referenceNumber}" already exists`);
+      }
+    }
+
+    // Only allow updating descriptive fields (financial/address fields ignored)
+    const updateData: any = {};
+    if (dto.description !== undefined) updateData.description = dto.description;
+    if (dto.referenceNumber !== undefined) updateData.referenceNumber = dto.referenceNumber;
+    if (dto.metadata !== undefined) updateData.metadata = dto.metadata;
+    if (dto.tags !== undefined) updateData.tags = dto.tags;
+
+    const updated = await this.prisma.shipment.update({
+      where: { id },
+      data: updateData,
+      include: {
+        milestones: { orderBy: { milestoneIndex: 'asc' } },
+        events: { orderBy: { ledger: 'desc' }, take: 20 },
+      },
+    });
+
+    this.logger.log(`Shipment updated: ${id}`);
+    return this.serialize(updated);
+  }
+
   // ----------------------------------------------------------
   // SYNC FROM CHAIN — called by EventsService after polling
   // ----------------------------------------------------------
 
   async syncStatusFromChain(shipmentId: string) {
     try {
+      // Convert shipmentId to ScVal String for contract call
+      const shipmentIdScVal = nativeToScVal(shipmentId, { type: 'string' });
+      
       const onChain = await this.stellar.simulateContractCall('get_shipment', [
-        // TODO: convert shipmentId to ScVal String
-        // nativeToScVal(shipmentId, { type: 'string' })
+        shipmentIdScVal,
       ]);
 
-      if (!onChain) return;
+      // If contract returns null, shipment doesn't exist on-chain yet
+      if (!onChain) {
+        this.logger.warn(
+          `Shipment ${shipmentId} not found on-chain. It may not be created yet or the ID is incorrect.`
+        );
+        return;
+      }
 
       // Map on-chain status to Prisma enum
       const statusMap: Record<string, ShipmentStatus> = {
@@ -127,17 +207,45 @@ export class ShipmentsService {
         Cancelled: ShipmentStatus.CANCELLED,
       };
 
+      const mappedStatus = statusMap[onChain.status];
+      
+      if (!mappedStatus) {
+        this.logger.warn(
+          `Unknown on-chain status "${onChain.status}" for shipment ${shipmentId}. Skipping update.`
+        );
+        return;
+      }
+
+      // Parse released amount - handle both string and number formats
+      const releasedAmount = onChain.released_amount 
+        ? BigInt(onChain.released_amount.toString())
+        : BigInt(0);
+
       await this.prisma.shipment.update({
         where: { id: shipmentId },
         data: {
-          status: statusMap[onChain.status] ?? ShipmentStatus.ACTIVE,
-          releasedAmount: BigInt(onChain.released_amount ?? 0),
+          status: mappedStatus,
+          releasedAmount,
         },
       });
 
-      this.logger.log(`Synced shipment ${shipmentId} from chain`);
+      this.logger.log(
+        `Synced shipment ${shipmentId} from chain: status=${mappedStatus}, releasedAmount=${releasedAmount}`
+      );
     } catch (error) {
-      this.logger.error(`Failed to sync shipment ${shipmentId}`, error.message);
+      // Check if it's a "shipment not found in DB" error
+      if (error.code === 'P2025') {
+        this.logger.warn(
+          `Cannot sync shipment ${shipmentId}: not found in database`
+        );
+        return;
+      }
+      
+      this.logger.error(
+        `Failed to sync shipment ${shipmentId} from chain: ${error.message}`,
+        error.stack
+      );
+      // Don't throw - allow the process to continue
     }
   }
 
@@ -146,14 +254,25 @@ export class ShipmentsService {
   // ----------------------------------------------------------
 
   private serialize(shipment: any) {
+    const now = new Date();
     return {
       ...shipment,
       totalAmount: shipment.totalAmount?.toString(),
       releasedAmount: shipment.releasedAmount?.toString(),
-      milestones: shipment.milestones?.map((m: any) => ({
-        ...m,
-        paymentReleased: m.paymentReleased?.toString() ?? null,
-      })),
+      milestones: shipment.milestones?.map((m: any) => {
+        // A milestone is overdue if: dueAt < now AND status is not CONFIRMED or RESOLVED
+        const isOverdue =
+          m.dueAt && 
+          m.dueAt < now && 
+          m.status !== 'CONFIRMED' && 
+          m.status !== 'RESOLVED';
+
+        return {
+          ...m,
+          paymentReleased: m.paymentReleased?.toString() ?? null,
+          isOverdue: Boolean(isOverdue),
+        };
+      }),
     };
   }
 }

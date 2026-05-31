@@ -7,6 +7,9 @@ import {
   Min,
   Max,
   IsOptional,
+  IsISO8601,
+  MaxLength,
+  IsObject,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { ApiProperty } from '@nestjs/swagger';
@@ -22,6 +25,11 @@ export class MilestoneDto {
   @Min(1)
   @Max(100)
   paymentPercent: number;
+
+  @ApiProperty({ required: false, example: '2026-06-30T23:59:59Z', description: 'Optional milestone deadline (ISO 8601)' })
+  @IsOptional()
+  @IsISO8601()
+  dueAt?: string;
 }
 
 export class CreateShipmentDto {
@@ -70,4 +78,50 @@ export class CreateShipmentDto {
   @IsOptional()
   @IsString()
   txHash?: string;
+
+  @ApiProperty({ required: false, example: 'Electronics shipment from China', description: 'Human-readable description of shipment contents (max 1000 chars)' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(1000)
+  description?: string;
+
+  @ApiProperty({ required: false, example: 'PO-2026-001', description: 'Contract/PO reference number (must be unique)' })
+  @IsOptional()
+  @IsString()
+  referenceNumber?: string;
+
+  @ApiProperty({ required: false, example: { incoterms: 'FOB', portOfLoading: 'Lagos' }, description: 'Arbitrary key-value metadata' })
+  @IsOptional()
+  @IsObject()
+  metadata?: Record<string, any>;
+
+  @ApiProperty({ required: false, example: ['urgent', 'fragile'], description: 'Searchable tags' })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  tags?: string[];
+}
+
+export class UpdateShipmentDto {
+  @ApiProperty({ required: false, example: 'Electronics shipment from China', description: 'Human-readable description (max 1000 chars)' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(1000)
+  description?: string;
+
+  @ApiProperty({ required: false, example: 'PO-2026-001', description: 'Contract/PO reference number (must be unique)' })
+  @IsOptional()
+  @IsString()
+  referenceNumber?: string;
+
+  @ApiProperty({ required: false, example: { incoterms: 'FOB', portOfLoading: 'Lagos' }, description: 'Arbitrary key-value metadata' })
+  @IsOptional()
+  @IsObject()
+  metadata?: Record<string, any>;
+
+  @ApiProperty({ required: false, example: ['urgent', 'fragile'], description: 'Searchable tags' })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  tags?: string[];
 }
