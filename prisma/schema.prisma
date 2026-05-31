@@ -95,6 +95,7 @@ model User {
   auditLogs          AuditLog[]     @relation("AuditLogs")
   disputeEvidence    DisputeEvidence[]
   comments           ShipmentComment[]
+  shipmentTemplates  ShipmentTemplate[] @relation("ShipmentTemplates")
 
   @@map("users")
 }
@@ -274,3 +275,26 @@ model AuditLog {
   @@index([entityType, entityId])
   @@map("audit_logs")
 }
+
+model ShipmentTemplate {
+  id                String   @id @default(uuid())
+  ownerId           String
+  name              String
+  description       String?
+  supplierAddress   String?
+  logisticsAddress  String?
+  arbiterAddress    String?
+  tokenAddress      String?
+  milestoneTemplates Json    // array of { name, paymentPercent, dueDays? }
+  isPublic          Boolean  @default(false)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relations
+  owner User @relation("ShipmentTemplates", fields: [ownerId], references: [id], onDelete: Cascade)
+
+  @@index([ownerId])
+  @@index([isPublic])
+  @@map("shipment_templates")
+}
+

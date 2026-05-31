@@ -33,6 +33,9 @@ export class ShipmentsService {
    * Saves a shipment record in the database after the buyer has
    * submitted the create_shipment transaction via the frontend.
    * The frontend sends the confirmed txHash back here.
+   * 
+   * If templateId is provided, pre-populate fields from the template.
+   * Explicit fields in the request override template values.
    */
   async create(dto: CreateShipmentDto) {
     const existing = await this.prisma.shipment.findUnique({
@@ -52,16 +55,48 @@ export class ShipmentsService {
       }
     }
 
-    const token = this.tokenRegistry.getToken(dto.tokenAddress);
+    // Pre-populate from template if provided
+    let templateData: any = {};
+    if (dto.templateId) {
+      const template = await this.prisma.shipmentTemplate.findUnique({
+        where: { id: dto.templateId },
+      });
+      if (!template) {
+        throw new NotFoundException(`Template ${dto.templateId} not found`);
+      }
+      templateData = {
+        supplierAddress: template.supplierAddress,
+        logisticsAddress: template.logisticsAddress,
+        arbiterAddress: template.arbiterAddress,
+        tokenAddress: template.tokenAddress,
+        milestones: template.milestoneTemplates,
+      };
+    }
+
+    // Merge template data with explicit request values (request overrides template)
+    const supplierAddress = dto.supplierAddress ?? templateData.supplierAddress;
+    const logisticsAddress = dto.logisticsAddress ?? templateData.logisticsAddress;
+    const arbiterAddress = dto.arbiterAddress ?? templateData.arbiterAddress;
+    const tokenAddress = dto.tokenAddress ?? templateData.tokenAddress;
+    const milestones = dto.milestones ?? templateData.milestones;
+
+    // Validate required fields
+    if (!supplierAddress || !logisticsAddress || !arbiterAddress || !tokenAddress || !milestones) {
+      throw new ConflictException(
+        'Missing required fields: supplierAddress, logisticsAddress, arbiterAddress, tokenAddress, milestones',
+      );
+    }
+
+    const token = this.tokenRegistry.getToken(tokenAddress);
 
     const shipment = await this.prisma.shipment.create({
       data: {
         id: dto.shipmentId,
         buyerAddress: dto.buyerAddress,
-        supplierAddress: dto.supplierAddress,
-        logisticsAddress: dto.logisticsAddress,
-        arbiterAddress: dto.arbiterAddress,
-        tokenAddress: dto.tokenAddress,
+        supplierAddress,
+        logisticsAddress,
+        arbiterAddress,
+        tokenAddress,
         tokenDecimals: token.decimals,
         tokenSymbol: token.symbol,
         totalAmount: BigInt(dto.totalAmount),
@@ -71,11 +106,12 @@ export class ShipmentsService {
         metadata: dto.metadata,
         tags: dto.tags ?? [],
         milestones: {
-          create: dto.milestones.map((m, index) => ({
+          create: milestones.map((m, index) => ({
             milestoneIndex: index,
             name: m.name,
             paymentPercent: m.paymentPercent,
             ...(m.dueAt ? { dueAt: new Date(m.dueAt) } : {}),
+            ...(m.dueDays ? { dueAt: new Date(Date.now() + m.dueDays * 24 * 60 * 60 * 1000) } : {}),
           })),
         },
       },

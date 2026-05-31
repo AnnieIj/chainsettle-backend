@@ -39,6 +39,9 @@ export class ShipmentsController {
    * Called by the frontend after the buyer has signed and broadcast
    * the create_shipment transaction via Freighter. The backend stores
    * the off-chain metadata and links it to the on-chain shipment.
+   * 
+   * If templateId is provided, fields are pre-populated from the template.
+   * Explicit fields in the request override template values.
    */
   @Post()
   @HttpCode(HttpStatus.CREATED)

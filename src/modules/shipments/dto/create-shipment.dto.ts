@@ -38,41 +38,47 @@ export class CreateShipmentDto {
   @IsNotEmpty()
   shipmentId: string;
 
+  @ApiProperty({ required: false, example: 'template-uuid', description: 'Optional template ID to pre-populate from' })
+  @IsOptional()
+  @IsString()
+  templateId?: string;
+
   @ApiProperty({ example: 'GABC...buyer' })
   @IsString()
   @IsNotEmpty()
   buyerAddress: string;
 
-  @ApiProperty({ example: 'GABC...supplier' })
+  @ApiProperty({ example: 'GABC...supplier', required: false })
+  @IsOptional()
   @IsString()
-  @IsNotEmpty()
-  supplierAddress: string;
+  supplierAddress?: string;
 
-  @ApiProperty({ example: 'GABC...logistics' })
+  @ApiProperty({ example: 'GABC...logistics', required: false })
+  @IsOptional()
   @IsString()
-  @IsNotEmpty()
-  logisticsAddress: string;
+  logisticsAddress?: string;
 
-  @ApiProperty({ example: 'GABC...arbiter' })
+  @ApiProperty({ example: 'GABC...arbiter', required: false })
+  @IsOptional()
   @IsString()
-  @IsNotEmpty()
-  arbiterAddress: string;
+  arbiterAddress?: string;
 
-  @ApiProperty({ example: 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA' })
+  @ApiProperty({ example: 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA', required: false })
+  @IsOptional()
   @IsString()
-  @IsNotEmpty()
-  tokenAddress: string;
+  tokenAddress?: string;
+
+  @ApiProperty({ type: [MilestoneDto], required: false })
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => MilestoneDto)
+  milestones?: MilestoneDto[];
 
   @ApiProperty({ example: '1000000000', description: 'Total USDC in stroops (7 decimal places)' })
   @IsString()
   @IsNotEmpty()
   totalAmount: string;
-
-  @ApiProperty({ type: [MilestoneDto] })
-  @IsArray()
-  @ValidateNested({ each: true })
-  @Type(() => MilestoneDto)
-  milestones: MilestoneDto[];
 
   @ApiProperty({ required: false, description: 'On-chain transaction hash of the create_shipment call' })
   @IsOptional()

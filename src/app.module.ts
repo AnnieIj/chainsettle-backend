@@ -14,6 +14,7 @@ import { RedisThrottlerStorageService } from './common/throttler/redis-throttler
 
 import { AuthModule } from './modules/auth/auth.module';
 import { ShipmentsModule } from './modules/shipments/shipments.module';
+import { ShipmentTemplatesModule } from './modules/shipment-templates/shipment-templates.module';
 import { MilestonesModule } from './modules/milestones/milestones.module';
 import { EventsModule } from './modules/events/events.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
@@ -61,6 +62,7 @@ import { AuditLogInterceptor } from './modules/audit-logs/audit-log.interceptor'
     // Feature modules
     AuthModule,
     ShipmentsModule,
+    ShipmentTemplatesModule,
     MilestonesModule,
     EventsModule,
     NotificationsModule,
