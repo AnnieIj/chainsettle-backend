@@ -13,7 +13,7 @@ export class RedisService implements OnModuleDestroy {
 
   constructor(private readonly configService: ConfigService) {
     const redisUrl = this.configService.get<string>('REDIS_URL', 'redis://localhost:6379');
-    
+
     this.client = new Redis(redisUrl, {
       maxRetriesPerRequest: 3,
       enableReadyCheck: true,
@@ -55,6 +55,14 @@ export class RedisService implements OnModuleDestroy {
       await this.client.set(key, value);
     }
   }
+
+  /**
+   * Set a key with expiration (in milliseconds) using Redis native PX.
+   */
+  async setPx(key: string, value: string, ttlMs: number): Promise<void> {
+    await this.client.set(key, value, 'PX', ttlMs);
+  }
+
 
   /**
    * Get a key

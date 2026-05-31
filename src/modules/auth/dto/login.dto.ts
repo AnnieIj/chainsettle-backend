@@ -1,4 +1,4 @@
-import { IsString, IsNotEmpty } from 'class-validator';
+import { IsString, IsNotEmpty, Matches } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
 export class LoginDto {
@@ -15,5 +15,8 @@ export class LoginDto {
   @ApiProperty({ description: 'Base64-encoded Stellar signature of the nonce' })
   @IsString()
   @IsNotEmpty()
+  @Matches(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/, {
+    message: 'signature must be a valid Base64 string',
+  })
   signature: string;
 }
