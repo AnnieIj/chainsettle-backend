@@ -415,6 +415,131 @@ export class ShipmentsService {
   }
 
   // ----------------------------------------------------------
+  // EXPORT
+  // ----------------------------------------------------------
+
+  async exportForUser(callerStellarAddress: string, isAdmin: boolean) {
+    const where: any = {};
+    if (!isAdmin) {
+      where.OR = [
+        { buyerAddress: callerStellarAddress },
+        { supplierAddress: callerStellarAddress },
+        { logisticsAddress: callerStellarAddress },
+        { arbiterAddress: callerStellarAddress },
+      ];
+    }
+
+    return this.prisma.shipment.findMany({
+      where,
+      include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  buildCsv(shipments: any[]): string {
+    const headers = [
+      'shipmentId', 'buyerAddress', 'supplierAddress', 'logisticsAddress',
+      'arbiterAddress', 'totalAmount', 'releasedAmount', 'status', 'createdAt',
+      'milestoneName', 'milestoneIndex', 'paymentPercent', 'milestoneStatus',
+      'proofHash', 'confirmedAt',
+    ];
+
+    const escape = (v: any) => {
+      const s = v == null ? '' : String(v);
+      return s.includes(',') || s.includes('"') || s.includes('\n')
+        ? `"${s.replace(/"/g, '""')}"`
+        : s;
+    };
+
+    const decimals = 7;
+    const toUsdc = (raw: bigint) =>
+      this.stellar.toHumanAmount(raw ?? 0n, decimals);
+
+    const rows: string[] = [headers.join(',')];
+
+    for (const s of shipments) {
+      const base = [
+        s.id, s.buyerAddress, s.supplierAddress, s.logisticsAddress,
+        s.arbiterAddress,
+        toUsdc(s.totalAmount),
+        toUsdc(s.releasedAmount),
+        s.status,
+        s.createdAt?.toISOString() ?? '',
+      ];
+
+      if (!s.milestones?.length) {
+        rows.push([...base, '', '', '', '', '', ''].map(escape).join(','));
+      } else {
+        for (const m of s.milestones) {
+          rows.push([
+            ...base,
+            m.name, m.milestoneIndex, m.paymentPercent,
+            m.status, m.proofHash ?? '', m.confirmedAt?.toISOString() ?? '',
+          ].map(escape).join(','));
+        }
+      }
+    }
+
+    return rows.join('\n');
+  }
+
+  buildPdf(shipments: any[]): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const PDFDocument = require('pdfkit');
+      const doc = new PDFDocument({ margin: 40, size: 'A4' });
+      const chunks: Buffer[] = [];
+      doc.on('data', (c: Buffer) => chunks.push(c));
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
+      doc.on('error', reject);
+
+      const decimals = 7;
+      const toUsdc = (raw: bigint) =>
+        this.stellar.toHumanAmount(raw ?? 0n, decimals);
+
+      doc.fontSize(18).text('ChainSettle — Escrow Export', { align: 'center' });
+      doc.fontSize(10).text(`Generated: ${new Date().toISOString()}`, { align: 'center' });
+      doc.moveDown();
+
+      for (const s of shipments) {
+        doc.fontSize(13).text(`Shipment: ${s.id}`, { underline: true });
+        doc.fontSize(9);
+
+        const participants = [
+          ['Buyer', s.buyerAddress],
+          ['Supplier', s.supplierAddress],
+          ['Logistics', s.logisticsAddress],
+          ['Arbiter', s.arbiterAddress],
+        ];
+        for (const [role, addr] of participants) {
+          doc.text(`${role}: ${addr}`);
+        }
+
+        doc.moveDown(0.5);
+        doc.text(`Status: ${s.status}   Total: ${toUsdc(s.totalAmount)} USDC   Released: ${toUsdc(s.releasedAmount)} USDC`);
+        doc.text(`Created: ${s.createdAt?.toISOString() ?? ''}`);
+
+        if (s.milestones?.length) {
+          doc.moveDown(0.5).fontSize(10).text('Milestones:', { underline: true });
+          doc.fontSize(9);
+          for (const m of s.milestones) {
+            doc.text(
+              `  [${m.milestoneIndex}] ${m.name} — ${m.paymentPercent}% — ${m.status}` +
+              (m.confirmedAt ? ` — confirmed ${m.confirmedAt.toISOString()}` : ''),
+            );
+          }
+        }
+
+        doc.moveDown();
+        doc.moveTo(40, doc.y).lineTo(555, doc.y).stroke();
+        doc.moveDown();
+      }
+
+      doc.end();
+    });
+  }
+
+  // ----------------------------------------------------------
   // INTERNAL HELPERS
   // ----------------------------------------------------------
 
