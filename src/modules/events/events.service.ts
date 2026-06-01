@@ -16,9 +16,9 @@ const MAX_ATTEMPTS = 5;
  * Polls the Stellar RPC every 5 seconds for new contract events emitted
  * by the ChainSettle contract. When events are detected:
  *
- *  1. The relevant DB records (shipments, milestones) are updated
- *  2. Notifications are dispatched to the relevant users
- *  3. The event is saved to the chain_events table for audit trail
+ * 1. The relevant DB records (shipments, milestones) are updated
+ * 2. Notifications are dispatched to the relevant users
+ * 3. The event is saved to the chain_events table for audit trail
  *
  * Failed events are persisted to failed_events (DLQ) and retried with
  * exponential back-off up to MAX_ATTEMPTS times.
@@ -227,7 +227,7 @@ export class EventsService implements OnModuleInit {
         NotificationType.PROOF_SUBMITTED,
         'Proof submitted for review',
         `Milestone ${milestoneIndex} proof has been submitted for shipment ${shipmentId}. Please review and confirm.`,
-        { shipmentId, milestoneIndex, proofHash },
+        { shipmentId, milestoneIndex, proofHash: '' },
       );
     }
   }
@@ -254,8 +254,6 @@ export class EventsService implements OnModuleInit {
     });
 
     if (shipment) {
-      // Use the shipment's stored token decimals and symbol so non-USDC
-      // tokens display their amounts correctly (fixes hard-coded 7 dp).
       const humanAmount = this.stellar.toHumanAmount(
         BigInt(paymentAmount ?? 0),
         shipment.tokenDecimals,
@@ -431,8 +429,35 @@ export class EventsService implements OnModuleInit {
   // READ ENDPOINTS (for EventsController)
   // ----------------------------------------------------------
 
-  async findAll(shipmentId?: string, page = 1, limit = 20) {
-    const where = shipmentId ? { shipmentId } : {};
+  async findAll(filters: {
+    shipmentId?: string;
+    startLedger?: number;
+    endLedger?: number;
+    eventName?: string;
+    page?: number;
+    limit?: number;
+  }) {
+    const {
+      shipmentId,
+      startLedger,
+      endLedger,
+      eventName,
+      page = 1,
+      limit = 20,
+    } = filters;
+
+    const where: any = {};
+
+    if (shipmentId) where.shipmentId = shipmentId;
+    if (eventName) where.eventName = eventName;
+
+    // Apply ledger range boundaries using Prisma comparison filters
+    if (startLedger || endLedger) {
+      where.ledger = {
+        ...(startLedger && { gte: startLedger }),
+        ...(endLedger && { lte: endLedger }),
+      };
+    }
 
     const [events, total] = await this.prisma.$transaction([
       this.prisma.chainEvent.findMany({
@@ -444,7 +469,15 @@ export class EventsService implements OnModuleInit {
       this.prisma.chainEvent.count({ where }),
     ]);
 
-    return { data: events, meta: { total, page, limit } };
+    return { 
+      data: events, 
+      meta: { 
+        total, 
+        page, 
+        limit,
+        totalPages: Math.ceil(total / limit)
+      } 
+    };
   }
 
   // ----------------------------------------------------------
@@ -468,21 +501,18 @@ export class EventsService implements OnModuleInit {
   }
 
   private async saveRawEvent(eventName: string, event: any, payload: any, tx?: any) {
-    // Use the injected transaction client if one was provided, else fall back to
-    // the global PrismaService so non-transactional callers still work.
     const client = tx ?? this.prisma;
     try {
       const shipmentId = this.extractShipmentId(payload);
 
       await client.chainEvent.upsert({
         where: {
-          // Idempotency: the same tx + event name should never be stored twice
           txHash_eventName: {
             txHash: event.txHash ?? '',
             eventName,
           },
         },
-        update: {}, // already exists — no-op
+        update: {}, 
         create: {
           eventName,
           ledger: event.ledger ?? 0,

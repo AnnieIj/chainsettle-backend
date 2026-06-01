@@ -9,11 +9,13 @@ import {
   Post,
   Query,
   UseGuards,
+  BadRequestException,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiBearerAuth, ApiQuery } from '@nestjs/swagger';
+import { ApiTags, ApiOperation, ApiBearerAuth } from '@nestjs/swagger';
 import { EventsService } from './events.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { FindAllEventsDto } from './dto/find-all-events.dto';
 
 @ApiTags('events')
 @ApiBearerAuth()
@@ -23,16 +25,15 @@ export class EventsController {
   constructor(private readonly eventsService: EventsService) {}
 
   @Get()
-  @ApiOperation({ summary: 'List on-chain events with optional shipment filter' })
-  @ApiQuery({ name: 'shipmentId', required: false })
-  @ApiQuery({ name: 'page', required: false, type: Number })
-  @ApiQuery({ name: 'limit', required: false, type: Number })
-  findAll(
-    @Query('shipmentId') shipmentId?: string,
-    @Query('page') page?: number,
-    @Query('limit') limit?: number,
-  ) {
-    return this.eventsService.findAll(shipmentId, page, limit);
+  @ApiOperation({ summary: 'List on-chain events with optional shipment, ledger range, and topic filters' })
+  findAll(@Query() query: FindAllEventsDto) {
+    // Validate boundaries: startLedger must be less than or equal to endLedger
+    if (query.startLedger && query.endLedger && query.startLedger > query.endLedger) {
+      throw new BadRequestException('startLedger sequence boundary cannot be greater than endLedger sequence boundary');
+    }
+
+    // Forward the unified query object to the service layer for processing
+    return this.eventsService.findAll(query);
   }
 
   // ----------------------------------------------------------
@@ -41,8 +42,6 @@ export class EventsController {
 
   @Get('admin/failed-events')
   @ApiOperation({ summary: '[Admin] List unresolved failed events (DLQ)' })
-  @ApiQuery({ name: 'page', required: false, type: Number })
-  @ApiQuery({ name: 'limit', required: false, type: Number })
   getFailedEvents(
     @CurrentUser() user: any,
     @Query('page') page?: number,

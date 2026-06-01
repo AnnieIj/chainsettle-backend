@@ -13,7 +13,6 @@ import { CreateShipmentDto } from './dto/create-shipment.dto';
 import { ShipmentStatus, NotificationType, ArbiterStatus } from '@prisma/client';
 import { nativeToScVal } from '@stellar/stellar-sdk';
 
-
 @Injectable()
 export class ShipmentsService {
   private readonly logger = new Logger(ShipmentsService.name);
@@ -33,8 +32,7 @@ export class ShipmentsService {
    * Saves a shipment record in the database after the buyer has
    * submitted the create_shipment transaction via the frontend.
    * The frontend sends the confirmed txHash back here.
-   * 
-   * If templateId is provided, pre-populate fields from the template.
+   * * If templateId is provided, pre-populate fields from the template.
    * Explicit fields in the request override template values.
    */
   async create(dto: CreateShipmentDto) {
@@ -143,6 +141,10 @@ export class ShipmentsService {
     tags?: string[];
     page?: number;
     limit?: number;
+    createdAfter?: string;
+    createdBefore?: string;
+    updatedAfter?: string;
+    updatedBefore?: string;
     callerStellarAddress?: string;
     isAdmin?: boolean;
   }) {
@@ -154,6 +156,10 @@ export class ShipmentsService {
       tags,
       page = 1,
       limit = 20,
+      createdAfter,
+      createdBefore,
+      updatedAfter,
+      updatedBefore,
       callerStellarAddress,
       isAdmin = false,
     } = filters;
@@ -166,6 +172,21 @@ export class ShipmentsService {
     if (referenceNumber) where.referenceNumber = referenceNumber;
     if (tags && tags.length > 0) {
       where.tags = { hasSome: tags };
+    }
+
+    // Dynamic chronological range bounds filters
+    if (createdAfter || createdBefore) {
+      where.createdAt = {
+        ...(createdAfter && { gte: new Date(createdAfter) }),
+        ...(createdBefore && { lte: new Date(createdBefore) }),
+      };
+    }
+
+    if (updatedAfter || updatedBefore) {
+      where.updatedAt = {
+        ...(updatedAfter && { gte: new Date(updatedAfter) }),
+        ...(updatedBefore && { lte: new Date(updatedBefore) }),
+      };
     }
 
     // Scope to shipments where the caller is a participant (buyer/supplier/logistics/arbiter)
@@ -197,7 +218,6 @@ export class ShipmentsService {
       meta: { total, page, limit, totalPages: Math.ceil(total / limit) },
     };
   }
-
 
   async findOne(id: string) {
     const shipment = await this.prisma.shipment.findUnique({

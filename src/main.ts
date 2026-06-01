@@ -35,13 +35,12 @@ async function bootstrap() {
   // Global prefix for all routes
   app.setGlobalPrefix(apiPrefix);
 
-  // Global validation pipe — auto-validates all DTOs
+  // Global validation pipe — safely auto-validates and transforms all incoming DTO inputs
   app.useGlobalPipes(
     new ValidationPipe({
-      whitelist: true,         // strip unknown fields
-      forbidNonWhitelisted: true,
-      transform: true,         // auto-transform types (string → number etc.)
-      transformOptions: { enableImplicitConversion: true },
+      whitelist: true,                                      // strip out all non-whitelisted fields sent in requests
+      transform: true,                                      // automatically transform plain objects to type-instantiated DTO classes
+      transformOptions: { enableImplicitConversion: true }, // ensures query strings safely cast into expected primitive types
     }),
   );
 

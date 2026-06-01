@@ -10,6 +10,7 @@ import {
   HttpCode,
   HttpStatus,
   ForbiddenException,
+  BadRequestException,
 } from '@nestjs/common';
 
 import {
@@ -17,15 +18,14 @@ import {
   ApiOperation,
   ApiResponse,
   ApiBearerAuth,
-  ApiQuery,
 } from '@nestjs/swagger';
 import { ShipmentsService } from './shipments.service';
 import { CreateShipmentDto, UpdateShipmentDto } from './dto/create-shipment.dto';
+import { FindAllShipmentsDto } from './dto/find-all-shipments.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { ShipmentParticipantGuard } from './guards/shipment-participant.guard';
-import { ShipmentStatus, UserRole } from '@prisma/client';
-
+import { UserRole } from '@prisma/client';
 
 @ApiTags('shipments')
 @ApiBearerAuth()
@@ -39,17 +39,12 @@ export class ShipmentsController {
    * Called by the frontend after the buyer has signed and broadcast
    * the create_shipment transaction via Freighter. The backend stores
    * the off-chain metadata and links it to the on-chain shipment.
-   * 
-   * If templateId is provided, fields are pre-populated from the template.
-   * Explicit fields in the request override template values.
    */
   @Post()
   @HttpCode(HttpStatus.CREATED)
   @ApiOperation({ summary: 'Register a newly created on-chain shipment' })
   @ApiResponse({ status: 201, description: 'Shipment registered successfully' })
   create(@Body() dto: CreateShipmentDto, @CurrentUser() user: any) {
-    // POST /shipments remains open to any authenticated user,
-    // but buyerAddress must match the authenticated caller.
     if (user?.role !== UserRole.ADMIN && dto.buyerAddress !== user?.stellarAddress) {
       throw new ForbiddenException('buyerAddress must match the authenticated user');
     }
@@ -57,49 +52,46 @@ export class ShipmentsController {
     return this.shipmentsService.create(dto);
   }
 
-
   /**
    * GET /api/v1/shipments
-   * List shipments with optional filters. Users see only their own shipments.
+   * List shipments with optional filters and date ranges. Users see only their own shipments.
    */
   @Get()
-  @ApiOperation({ summary: 'List shipments with filters and pagination' })
-  @ApiQuery({ name: 'buyerAddress', required: false })
-  @ApiQuery({ name: 'supplierAddress', required: false })
-  @ApiQuery({ name: 'status', required: false, enum: ShipmentStatus })
-  @ApiQuery({ name: 'referenceNumber', required: false })
-  @ApiQuery({ name: 'tags', required: false, description: 'Comma-separated tags' })
-  @ApiQuery({ name: 'page', required: false, type: Number })
-  @ApiQuery({ name: 'limit', required: false, type: Number })
-  findAll(
-    @CurrentUser() user: any,
-    @Query('buyerAddress') buyerAddress?: string,
-    @Query('supplierAddress') supplierAddress?: string,
-    @Query('status') status?: ShipmentStatus,
-    @Query('referenceNumber') referenceNumber?: string,
-    @Query('tags') tagsQuery?: string,
-    @Query('page') page?: number,
-    @Query('limit') limit?: number,
-  ) {
-    // Ignore buyerAddress/supplierAddress filters for non-admin callers
-    // to prevent listing other users' shipments.
-    const isAdmin = user?.role === UserRole.ADMIN;
-    const tags = tagsQuery ? tagsQuery.split(',').map((t) => t.trim()).filter(Boolean) : undefined;
+  @ApiOperation({ summary: 'List shipments with chronological filters and pagination' })
+  @ApiResponse({ status: 200, description: 'Filtered list of shipments' })
+  findAll(@CurrentUser() user: any, @Query() query: FindAllShipmentsDto) {
+    // 1. Cross-field Date Validations
+    if (query.createdAfter && query.createdBefore && new Date(query.createdAfter) > new Date(query.createdBefore)) {
+      throw new BadRequestException('createdAfter date cannot be further in the future than createdBefore date');
+    }
 
+    if (query.updatedAfter && query.updatedBefore && new Date(query.updatedAfter) > new Date(query.updatedBefore)) {
+      throw new BadRequestException('updatedAfter date cannot be further in the future than updatedBefore date');
+    }
+
+    // 2. Evaluate administrative scope constraints
+    const isAdmin = user?.role === UserRole.ADMIN;
+    
+    // Parse tag array structures safely from string formats
+    const tags = query.tags ? query.tags.split(',').map((t) => t.trim()).filter(Boolean) : undefined;
+
+    // 3. Delegate execution context payload down to service layers
     return this.shipmentsService.findAll({
-      buyerAddress: isAdmin ? buyerAddress : undefined,
-      supplierAddress: isAdmin ? supplierAddress : undefined,
-      status,
-      referenceNumber,
+      buyerAddress: isAdmin ? query.buyerAddress : undefined,
+      supplierAddress: isAdmin ? query.supplierAddress : undefined,
+      status: query.status,
+      referenceNumber: query.referenceNumber,
       tags,
-      page,
-      limit,
+      page: query.page,
+      limit: query.limit,
+      createdAfter: query.createdAfter,
+      createdBefore: query.createdBefore,
+      updatedAfter: query.updatedAfter,
+      updatedBefore: query.updatedBefore,
       callerStellarAddress: user?.stellarAddress,
       isAdmin,
     });
   }
-
-
 
   /**
    * GET /api/v1/shipments/:id
@@ -114,11 +106,9 @@ export class ShipmentsController {
     return this.shipmentsService.findOne(id);
   }
 
-
   /**
    * PATCH /api/v1/shipments/:id
    * Update shipment metadata (description, referenceNumber, metadata, tags).
-   * Only the buyer can update. Financial fields are immutable.
    */
   @Patch(':id')
   @HttpCode(HttpStatus.OK)
@@ -132,8 +122,6 @@ export class ShipmentsController {
 
   /**
    * POST /api/v1/shipments/:id/arbiter/accept
-   * Designated arbiter accepts their assignment. Sets arbiterStatus to ACCEPTED
-   * and notifies the buyer.
    */
   @Post(':id/arbiter/accept')
   @HttpCode(HttpStatus.OK)
@@ -147,8 +135,6 @@ export class ShipmentsController {
 
   /**
    * POST /api/v1/shipments/:id/arbiter/decline
-   * Designated arbiter declines their assignment. Sets arbiterStatus to DECLINED
-   * and notifies the buyer.
    */
   @Post(':id/arbiter/decline')
   @HttpCode(HttpStatus.OK)
@@ -162,7 +148,6 @@ export class ShipmentsController {
 
   /**
    * POST /api/v1/shipments/:id/sync
-   * Manually trigger a sync of the shipment state from the Stellar chain.
    */
   @Post(':id/sync')
   @UseGuards(ShipmentParticipantGuard)
@@ -171,5 +156,4 @@ export class ShipmentsController {
   sync(@Param('id') id: string) {
     return this.shipmentsService.syncStatusFromChain(id);
   }
-
 }
