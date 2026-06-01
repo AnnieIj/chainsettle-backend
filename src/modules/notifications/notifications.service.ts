@@ -4,6 +4,7 @@ import * as nodemailer from 'nodemailer';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { NotificationType } from '@prisma/client';
 import { NotificationsGateway } from './notifications.gateway';
+import { WebhooksService } from '../webhooks/webhooks.service';
 
 @Injectable()
 export class NotificationsService {
@@ -14,6 +15,7 @@ export class NotificationsService {
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
     @Optional() private readonly gateway: NotificationsGateway,
+    @Optional() private readonly webhooks: WebhooksService,
   ) {
     this.transporter = nodemailer.createTransport({
       host: this.config.get('SMTP_HOST'),
@@ -68,6 +70,11 @@ export class NotificationsService {
 
       // Push to any connected WebSocket clients for this user
       this.gateway?.pushToUser(user.id, notification);
+
+      // Fan-out to active webhook endpoints subscribed to this event type
+      this.webhooks
+        ?.dispatch(type, { notificationId: notification.id, ...(data ?? {}) })
+        .catch((err) => this.logger.error('Webhook dispatch error', err.message));
 
       return notification;
     } catch (error) {

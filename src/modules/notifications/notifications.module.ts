@@ -5,6 +5,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { NotificationsService } from './notifications.service';
 import { NotificationsController } from './notifications.controller';
 import { NotificationsGateway } from './notifications.gateway';
+import { WebhooksModule } from '../webhooks/webhooks.module';
 
 @Module({
   imports: [
@@ -17,6 +18,7 @@ import { NotificationsGateway } from './notifications.gateway';
         signOptions: { expiresIn: config.get<string>('JWT_EXPIRES_IN', '7d') },
       }),
     }),
+    WebhooksModule,
   ],
   providers: [NotificationsService, NotificationsGateway],
   controllers: [NotificationsController],

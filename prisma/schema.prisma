@@ -96,6 +96,7 @@ model User {
   disputeEvidence    DisputeEvidence[]
   comments           ShipmentComment[]
   shipmentTemplates  ShipmentTemplate[] @relation("ShipmentTemplates")
+  webhookEndpoints   WebhookEndpoint[]
 
   @@map("users")
 }
@@ -274,6 +275,40 @@ model AuditLog {
   @@index([userId])
   @@index([entityType, entityId])
   @@map("audit_logs")
+}
+
+model WebhookEndpoint {
+  id         String    @id @default(uuid())
+  userId     String
+  url        String
+  secret     String    // SHA-256 hash of the plaintext signing secret
+  events     String[]  // NotificationType values this endpoint subscribes to
+  active     Boolean   @default(true)
+  createdAt  DateTime  @default(now())
+
+  user       User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deliveries WebhookDelivery[]
+
+  @@index([userId])
+  @@map("webhook_endpoints")
+}
+
+model WebhookDelivery {
+  id           String    @id @default(uuid())
+  endpointId   String
+  eventType    String
+  payload      Json
+  statusCode   Int?
+  responseBody String?
+  deliveredAt  DateTime?
+  nextRetryAt  DateTime?
+  attemptCount Int       @default(0)
+
+  endpoint WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+
+  @@index([endpointId])
+  @@index([nextRetryAt])
+  @@map("webhook_deliveries")
 }
 
 model ShipmentTemplate {
