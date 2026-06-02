@@ -6,19 +6,21 @@ import {
   Body,
   Param,
   Query,
+  Res,
   UseGuards,
   HttpCode,
   HttpStatus,
   ForbiddenException,
   BadRequestException,
 } from '@nestjs/common';
-
+import { Response } from 'express';
 import {
   ApiTags,
   ApiOperation,
   ApiResponse,
   ApiBearerAuth,
 } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
 import { ShipmentsService } from './shipments.service';
 import { CreateShipmentDto, UpdateShipmentDto } from './dto/create-shipment.dto';
 import { FindAllShipmentsDto } from './dto/find-all-shipments.dto';
@@ -92,6 +94,42 @@ export class ShipmentsController {
       isAdmin,
     });
   }
+
+  /**
+   * GET /api/v1/shipments/export?format=csv|pdf
+   * Export all shipments visible to the caller.
+   * Rate-limited to 5 requests per hour per user.
+   */
+  @Get('export')
+  @Throttle({ default: { limit: 5, ttl: 60 * 60 * 1000 } })
+  @ApiOperation({ summary: 'Export shipments as CSV or PDF' })
+  @ApiQuery({ name: 'format', required: false, enum: ['csv', 'pdf'], description: 'csv (default) or pdf' })
+  async export(
+    @CurrentUser() user: any,
+    @Query('format') format: string = 'csv',
+    @Res() res: Response,
+  ) {
+    if (!['csv', 'pdf'].includes(format)) {
+      throw new BadRequestException('format must be csv or pdf');
+    }
+
+    const isAdmin = user?.role === UserRole.ADMIN;
+    const shipments = await this.shipmentsService.exportForUser(user.stellarAddress, isAdmin);
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+
+    if (format === 'pdf') {
+      const pdf = await this.shipmentsService.buildPdf(shipments);
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `attachment; filename="chainsettle-export-${timestamp}.pdf"`);
+      res.end(pdf);
+    } else {
+      const csv = this.shipmentsService.buildCsv(shipments);
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="chainsettle-export-${timestamp}.csv"`);
+      res.end(csv);
+    }
+  }
+
 
   /**
    * GET /api/v1/shipments/:id
