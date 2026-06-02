@@ -13,6 +13,8 @@ import {
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { ApiProperty } from '@nestjs/swagger';
+// Add the import for your custom validator
+import { IsMilestoneSumValid } from '../../../common/validators/milestone-sum.validator';
 
 export class MilestoneDto {
   @ApiProperty({ example: 'Goods Dispatched' })
@@ -73,6 +75,7 @@ export class CreateShipmentDto {
   @IsArray()
   @ValidateNested({ each: true })
   @Type(() => MilestoneDto)
+  @IsMilestoneSumValid() // <-- The new cross-field validation is applied here
   milestones?: MilestoneDto[];
 
   @ApiProperty({ example: '1000000000', description: 'Total USDC in stroops (7 decimal places)' })

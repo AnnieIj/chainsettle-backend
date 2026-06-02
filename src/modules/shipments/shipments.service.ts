@@ -4,6 +4,7 @@ import {
   Logger,
   ConflictException,
   ForbiddenException,
+  BadRequestException, // <-- Added this import
 } from '@nestjs/common';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { StellarService } from '../../common/stellar/stellar.service';
@@ -12,7 +13,6 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { CreateShipmentDto } from './dto/create-shipment.dto';
 import { ShipmentStatus, NotificationType, ArbiterStatus } from '@prisma/client';
 import { nativeToScVal } from '@stellar/stellar-sdk';
-
 
 @Injectable()
 export class ShipmentsService {
@@ -33,8 +33,7 @@ export class ShipmentsService {
    * Saves a shipment record in the database after the buyer has
    * submitted the create_shipment transaction via the frontend.
    * The frontend sends the confirmed txHash back here.
-   * 
-   * If templateId is provided, pre-populate fields from the template.
+   * * If templateId is provided, pre-populate fields from the template.
    * Explicit fields in the request override template values.
    */
   async create(dto: CreateShipmentDto) {
@@ -87,6 +86,23 @@ export class ShipmentsService {
       );
     }
 
+    // ==========================================================
+    // STEP 3: Defensive Guard for Milestone Payment Sum
+    // ==========================================================
+    if (milestones && milestones.length > 0) {
+      const sum = milestones.reduce(
+        (total: number, m: any) => total + (m.paymentPercent || 0),
+        0,
+      );
+
+      if (sum !== 100) {
+        throw new BadRequestException(
+          `Milestone payment percentages must sum to exactly 100. Got ${sum}.`
+        );
+      }
+    }
+    // ==========================================================
+
     const token = this.tokenRegistry.getToken(tokenAddress);
 
     const shipment = await this.prisma.shipment.create({
@@ -106,7 +122,7 @@ export class ShipmentsService {
         metadata: dto.metadata,
         tags: dto.tags ?? [],
         milestones: {
-          create: milestones.map((m, index) => ({
+          create: milestones.map((m: any, index: number) => ({
             milestoneIndex: index,
             name: m.name,
             paymentPercent: m.paymentPercent,
