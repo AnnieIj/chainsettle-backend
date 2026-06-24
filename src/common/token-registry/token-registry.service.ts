@@ -70,4 +70,13 @@ export class TokenRegistryService {
   getToken(contractAddress: string): TokenInfo {
     return this.registry.get(contractAddress) ?? { symbol: 'UNKNOWN', decimals: 7 };
   }
+
+  /**
+   * Returns all registered tokens sorted alphabetically by symbol.
+   */
+  listTokens(): Array<{ address: string; symbol: string; decimals: number }> {
+    return Array.from(this.registry.entries())
+      .map(([address, { symbol, decimals }]) => ({ address, symbol, decimals }))
+      .sort((a, b) => a.symbol.localeCompare(b.symbol));
+  }
 }
