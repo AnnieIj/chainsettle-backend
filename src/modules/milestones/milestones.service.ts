@@ -232,7 +232,7 @@ export class MilestonesService {
 
     if (file) {
       try {
-        ipfsCid = await this.ipfs.uploadFile(file.buffer, file.originalname);
+        ipfsCid = await this.ipfs.uploadFile(file.buffer, file.originalname, file.mimetype);
         fileName = file.originalname;
         fileSize = file.size;
         mimeType = file.mimetype;
