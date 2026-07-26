@@ -332,7 +332,11 @@ export class EventsService implements OnModuleInit {
 
     await this.prisma.shipment.update({
       where: { id: String(shipmentId) },
-      data: { status: 'CANCELLED' },
+      data: {
+        status: 'CANCELLED',
+        cancelledAt: new Date(),
+        refundTxHash: event.txHash ?? null,
+      },
     });
   }
 

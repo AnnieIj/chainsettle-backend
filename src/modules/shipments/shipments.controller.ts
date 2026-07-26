@@ -185,6 +185,19 @@ export class ShipmentsController {
   }
 
   /**
+   * GET /api/v1/shipments/:id/refund
+   * Returns refund details for a cancelled shipment.
+   */
+  @Get(':id/refund')
+  @UseGuards(ShipmentParticipantGuard)
+  @ApiOperation({ summary: 'Get refund details for a cancelled shipment' })
+  @ApiResponse({ status: 200, description: 'Refund details' })
+  @ApiResponse({ status: 404, description: 'Shipment not found or not cancelled' })
+  getRefund(@Param('id') id: string) {
+    return this.shipmentsService.getRefundDetail(id);
+  }
+
+  /**
    * POST /api/v1/shipments/:id/sync
    */
   @Post(':id/sync')
