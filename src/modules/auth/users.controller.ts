@@ -1,16 +1,26 @@
-import { Controller, Get, Patch, Body, UseGuards } from '@nestjs/common';
+import { Controller, Get, Patch, Post, Body, UseGuards, HttpCode, HttpStatus, Req } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth } from '@nestjs/swagger';
 import { AuthService } from './auth.service';
+import { SessionService } from './session.service';
 import { UpdateProfileDto } from './dto/update-profile.dto';
+import { RevokeAllSessionsDto } from './dto/revoke-all-sessions.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { AuditLogService } from '../audit-logs/audit-log.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import { NotificationType } from '@prisma/client';
 
 @ApiTags('users')
 @Controller('users')
 @UseGuards(JwtAuthGuard)
 @ApiBearerAuth()
 export class UsersController {
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly sessionService: SessionService,
+    private readonly auditLogs: AuditLogService,
+    private readonly notifications: NotificationsService,
+  ) {}
 
   @Get('me')
   @ApiOperation({ summary: 'Get the authenticated user profile' })
@@ -27,5 +37,60 @@ export class UsersController {
   @ApiResponse({ status: 409, description: 'Email already in use' })
   updateProfile(@CurrentUser() user: any, @Body() dto: UpdateProfileDto) {
     return this.authService.updateProfile(user.id, dto);
+  }
+
+  /**
+   * POST /users/me/sessions/revoke-all
+   *
+   * Revoke every active session for the authenticated user except the
+   * current one (unless includeCurrent: true is passed).
+   *
+   * After this call:
+   *  - Tokens from all other devices are added to the Redis blocklist
+   *    and will be rejected on their next request.
+   *  - The caller's own token continues to work (unless includeCurrent).
+   *  - An audit log entry is written.
+   *  - A SYSTEM_ALERT notification is sent.
+   */
+  @Post('me/sessions/revoke-all')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Revoke all sessions except the current one (sign out of all other devices)' })
+  @ApiResponse({ status: 200, description: 'Sessions revoked — returns { revokedCount }' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  async revokeAllSessions(
+    @CurrentUser() user: any,
+    @Body() dto: RevokeAllSessionsDto,
+    @Req() req: any,
+  ) {
+    const currentJti: string = user.jti ?? '';
+    const includeCurrent = dto.includeCurrent ?? false;
+
+    const revokedCount = await this.sessionService.revokeAllSessions(
+      user.id,
+      currentJti,
+      includeCurrent,
+    );
+
+    // Audit log
+    await this.auditLogs.record({
+      actorId: user.id,
+      actorAddress: user.stellarAddress,
+      action: 'session.revoke_all',
+      resourceType: 'user',
+      resourceId: user.id,
+      metadata: { revokedCount, includeCurrent },
+      ipAddress: req.ip,
+    });
+
+    // In-app + email notification
+    await this.notifications.notifyUser(
+      user.stellarAddress,
+      NotificationType.SYSTEM_ALERT,
+      'Security alert: sessions revoked',
+      `${revokedCount} active session(s) were signed out${includeCurrent ? ', including your current session' : ''}.`,
+      { revokedCount, includeCurrent },
+    );
+
+    return { revokedCount };
   }
 }

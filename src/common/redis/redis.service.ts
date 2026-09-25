@@ -92,4 +92,29 @@ export class RedisService implements OnModuleDestroy {
   async ttl(key: string): Promise<number> {
     return this.client.ttl(key);
   }
+
+  // ------------------------------------------------------------------
+  // Redis Set operations (used for per-user session tracking)
+  // ------------------------------------------------------------------
+
+  /**
+   * Add one or more members to a Redis set.
+   */
+  async sadd(key: string, ...members: string[]): Promise<void> {
+    await this.client.sadd(key, ...members);
+  }
+
+  /**
+   * Return all members of a Redis set.
+   */
+  async smembers(key: string): Promise<string[]> {
+    return this.client.smembers(key);
+  }
+
+  /**
+   * Remove one or more members from a Redis set.
+   */
+  async srem(key: string, ...members: string[]): Promise<void> {
+    await this.client.srem(key, ...members);
+  }
 }

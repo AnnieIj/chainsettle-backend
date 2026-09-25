@@ -1,12 +1,14 @@
 import { Injectable, UnauthorizedException, ConflictException, Logger } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
+import { randomUUID } from 'crypto';
 import { Keypair } from '@stellar/stellar-sdk';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { RedisService } from '../../common/redis/redis.service';
 import { LoginDto } from './dto/login.dto';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { NotificationsService } from '../notifications/notifications.service';
+import { SessionService } from './session.service';
 
 /**
  * AuthService
@@ -35,6 +37,7 @@ export class AuthService {
     private readonly redis: RedisService,
     private readonly config: ConfigService,
     private readonly notifications: NotificationsService,
+    private readonly sessions: SessionService,
   ) {}
 
   // ----------------------------------------------------------
@@ -93,12 +96,17 @@ export class AuthService {
       update: { updatedAt: new Date() },
     });
 
-    // Sign JWT
+    // Sign JWT — embed a unique jti so this session can be individually revoked
+    const jti = randomUUID();
     const accessToken = this.jwt.sign({
       sub: user.id,
       stellarAddress: user.stellarAddress,
       role: user.role,
+      jti,
     });
+
+    // Track this session in Redis so revoke-all can enumerate it
+    await this.sessions.registerSession(user.id, jti);
 
     this.logger.log(`User authenticated: ${stellarAddress}`);
     return { accessToken, user };
