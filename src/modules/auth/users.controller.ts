@@ -30,10 +30,40 @@ export class UsersController {
     return this.authService.getProfile(user.id);
   }
 
+  @Get('me/sessions')
+  @ApiOperation({
+    summary: 'List active sessions for the authenticated user',
+    description:
+      'Returns metadata for every device/session currently authenticated against this account. ' +
+      'Raw token values are never included — only opaque session IDs and request metadata.',
+  })
+  @ApiResponse({ status: 200, description: 'Array of active session records' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  getSessions(@CurrentUser('id') userId: string) {
+    return this.authService.getSessions(userId);
+  }
+
+  @Post('me/sessions/:id/revoke')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Revoke a single active session for the authenticated user',
+    description:
+      'Deletes the selected session entry and adds its JWT to the revocation blocklist. ' +
+      'This invalidates only that device/session without logging out other active sessions.',
+  })
+  @ApiResponse({ status: 200, description: 'Session revoked successfully' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 404, description: 'Session not found' })
+  revokeSession(@CurrentUser('id') userId: string, @Param('id') sessionId: string) {
+    return this.authService.revokeSession(userId, sessionId);
+  }
+
   @Patch('me')
+  @BlockImpersonation()
   @ApiOperation({ summary: 'Update user profile (name, email)' })
   @ApiResponse({ status: 200, description: 'Profile updated successfully' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 403, description: 'Blocked during impersonation' })
   @ApiResponse({ status: 409, description: 'Email already in use' })
   updateProfile(@CurrentUser() user: any, @Body() dto: UpdateProfileDto) {
     return this.authService.updateProfile(user.id, dto);

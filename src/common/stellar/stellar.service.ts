@@ -1,8 +1,9 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   Networks,
   SorobanRpc,
+  Horizon,
   Contract,
   TransactionBuilder,
   BASE_FEE,
@@ -10,7 +11,10 @@ import {
   nativeToScVal,
   scValToNative,
   xdr,
+  StrKey,
 } from '@stellar/stellar-sdk';
+import { SpanKind } from '@opentelemetry/api';
+import { withSpan } from '../tracing/trace.helper';
 
 /**
  * StellarService
@@ -31,23 +35,27 @@ export class StellarService implements OnModuleInit {
   private readonly logger = new Logger(StellarService.name);
 
   private rpcClient: SorobanRpc.Server;
+   private horizonClient: Horizon.Server;
   private network: string;
   private networkPassphrase: string;
   private contractId: string;
 
   constructor(private readonly config: ConfigService) {}
 
-  onModuleInit() {
+onModuleInit() {
     const rpcUrl = this.config.get<string>('STELLAR_RPC_URL');
+    const horizonUrl = this.config.get<string>('STELLAR_HORIZON_URL');
     const networkName = this.config.get<string>('STELLAR_NETWORK', 'testnet');
 
     this.rpcClient = new SorobanRpc.Server(rpcUrl, { allowHttp: true });
+    this.horizonClient = new Horizon.Server(horizonUrl, { allowHttp: true });
     this.contractId = this.config.get<string>('CHAINSETTTLE_CONTRACT_ID');
 
     this.networkPassphrase =
       networkName === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
 
     this.logger.log(`Stellar connected to ${networkName} (${rpcUrl})`);
+    this.logger.log(`Horizon connected at ${horizonUrl}`);
     this.logger.log(`Contract ID: ${this.contractId}`);
   }
 
@@ -83,28 +91,43 @@ export class StellarService implements OnModuleInit {
     startLedger: number,
     filters: string[] = [],
   ): Promise<SorobanRpc.Api.EventResponse[]> {
-    try {
-      const topicFilters = filters.length > 0
-        ? filters.map((f) => [f])
-        : undefined;
+    return withSpan(
+      'stellar.fetchContractEvents',
+      async (span) => {
+        span.setAttribute('stellar.start_ledger', startLedger);
+        span.setAttribute('stellar.contract_id', this.contractId);
+        if (filters.length > 0) {
+          span.setAttribute('stellar.event_filters', filters.join(','));
+        }
 
-      const result = await this.rpcClient.getEvents({
-        startLedger,
-        filters: [
-          {
-            type: 'contract',
-            contractIds: [this.contractId],
-            ...(topicFilters && { topics: topicFilters }),
-          },
-        ],
-        limit: 100,
-      });
+        try {
+          const topicFilters = filters.length > 0
+            ? filters.map((f) => [f])
+            : undefined;
 
-      return result.events ?? [];
-    } catch (error) {
-      this.logger.error(`Failed to fetch events from ledger ${startLedger}`, error.message);
-      return [];
-    }
+          const result = await this.rpcClient.getEvents({
+            startLedger,
+            filters: [
+              {
+                type: 'contract',
+                contractIds: [this.contractId],
+                ...(topicFilters && { topics: topicFilters }),
+              },
+            ],
+            limit: 100,
+          });
+
+          const events = result.events ?? [];
+          span.setAttribute('stellar.event_count', events.length);
+          return events;
+        } catch (error) {
+          this.logger.error(`Failed to fetch events from ledger ${startLedger}`, error.message);
+          return [];
+        }
+      },
+      { 'stellar.rpc_url': this.config.get<string>('STELLAR_RPC_URL', '') },
+      SpanKind.CLIENT,
+    );
   }
 
   // ----------------------------------------------------------
@@ -120,40 +143,49 @@ export class StellarService implements OnModuleInit {
    * @returns Decoded native JS value from the contract
    */
   async simulateContractCall(method: string, args: xdr.ScVal[]): Promise<any> {
-    try {
-      const contract = new Contract(this.contractId);
+    return withSpan(
+      'stellar.simulateContractCall',
+      async (span) => {
+        span.setAttribute('stellar.contract_method', method);
+        span.setAttribute('stellar.contract_id', this.contractId);
 
-      // Use a dummy keypair for simulation (no funds needed)
-      const dummyKeypair = Keypair.random();
-      const dummyAccount = await this.rpcClient.getAccount(dummyKeypair.publicKey()).catch(() => ({
-        accountId: () => dummyKeypair.publicKey(),
-        sequenceNumber: () => '0',
-        incrementSequenceNumber: () => {},
-      }));
+        try {
+          const contract = new Contract(this.contractId);
 
-      const tx = new TransactionBuilder(dummyAccount as any, {
-        fee: BASE_FEE,
-        networkPassphrase: this.networkPassphrase,
-      })
-        .addOperation(contract.call(method, ...args))
-        .setTimeout(30)
-        .build();
+          const dummyKeypair = Keypair.random();
+          const dummyAccount = await this.rpcClient.getAccount(dummyKeypair.publicKey()).catch(() => ({
+            accountId: () => dummyKeypair.publicKey(),
+            sequenceNumber: () => '0',
+            incrementSequenceNumber: () => {},
+          }));
 
-      const simulation = await this.rpcClient.simulateTransaction(tx);
+          const tx = new TransactionBuilder(dummyAccount as any, {
+            fee: BASE_FEE,
+            networkPassphrase: this.networkPassphrase,
+          })
+            .addOperation(contract.call(method, ...args))
+            .setTimeout(30)
+            .build();
 
-      if (SorobanRpc.Api.isSimulationError(simulation)) {
-        throw new Error(`Contract simulation error: ${simulation.error}`);
-      }
+          const simulation = await this.rpcClient.simulateTransaction(tx);
 
-      if (SorobanRpc.Api.isSimulationSuccess(simulation) && simulation.result) {
-        return scValToNative(simulation.result.retval);
-      }
+          if (SorobanRpc.Api.isSimulationError(simulation)) {
+            throw new Error(`Contract simulation error: ${simulation.error}`);
+          }
 
-      return null;
-    } catch (error) {
-      this.logger.error(`simulateContractCall(${method}) failed`, error.message);
-      throw error;
-    }
+          if (SorobanRpc.Api.isSimulationSuccess(simulation) && simulation.result) {
+            return scValToNative(simulation.result.retval);
+          }
+
+          return null;
+        } catch (error) {
+          this.logger.error(`simulateContractCall(${method}) failed`, error.message);
+          throw error;
+        }
+      },
+      { 'stellar.rpc_url': this.config.get<string>('STELLAR_RPC_URL', '') },
+      SpanKind.CLIENT,
+    );
   }
 
   // ----------------------------------------------------------
@@ -204,5 +236,259 @@ export class StellarService implements OnModuleInit {
   async getLatestLedger(): Promise<number> {
     const info = await this.rpcClient.getLatestLedger();
     return info.sequence;
+  }
+
+  /**
+   * Fetches metadata for a specific ledger sequence number via the Stellar RPC.
+   * Returns { sequence, closedAt, txCount, baseFee } or null if not found.
+   */
+  async getLedger(sequence: number): Promise<{ sequence: number; closedAt: string; txCount: number; baseFee: number } | null> {
+    try {
+      const result = await (this.rpcClient as any).getLedger({ ledgerSeq: sequence });
+      if (!result) return null;
+      return {
+        sequence: result.sequence ?? sequence,
+        closedAt: result.closedAt ?? result.closed_at ?? '',
+        txCount: result.txCount ?? result.tx_count ?? 0,
+        baseFee: result.baseFee ?? result.base_fee ?? 0,
+      };
+    } catch (error) {
+      this.logger.error(`getLedger(${sequence}) failed`, error.message);
+      return null;
+    }
+  }
+
+  // ----------------------------------------------------------
+  // ACCOUNT LOOKUP (balance + trustlines)
+  // ----------------------------------------------------------
+
+  /**
+   * Fetches an account's XLM balance and trustlines via Horizon.
+   * Returns null if the account doesn't exist on-chain (unfunded address) —
+   * the caller is expected to translate that into a 404.
+   */
+  async getAccountInfo(address: string): Promise<{
+    address: string;
+    xlmBalance: string;
+    trustlines: { asset: string; balance: string; limit: string }[];
+  } | null> {
+    try {
+      const account = await this.horizonClient.loadAccount(address);
+
+      const native = account.balances.find(
+        (b) => b.asset_type === 'native',
+      );
+
+      const trustlines = account.balances
+        .filter((b) => b.asset_type !== 'native')
+        .map((b) => ({
+          asset:
+            'asset_code' in b && 'asset_issuer' in b
+              ? `${b.asset_code}:${b.asset_issuer}`
+              : b.asset_type,
+          balance: b.balance,
+          limit: 'limit' in b ? b.limit : '0',
+        }));
+
+      return {
+        address,
+        xlmBalance: native?.balance ?? '0',
+        trustlines,
+      };
+    } catch (error) {
+      if (error?.response?.status === 404) {
+        return null;
+      }
+      this.logger.error(`getAccountInfo(${address}) failed`, error.message);
+      throw error;
+    }
+  }
+  // ----------------------------------------------------------
+  // NETWORK STATUS SNAPSHOT
+  // ----------------------------------------------------------
+
+  /**
+   * Lightweight current-state snapshot for a status indicator / ops dashboard.
+   * Distinct from /health (DB + Redis focused) — this is purely RPC-facing
+   * and must never throw; a downstream RPC outage degrades to
+   * `rpcHealthy: false` rather than surfacing a 500.
+   */
+  async getNetworkStatus(): Promise<{
+    latestLedger: number | null;
+    networkPassphrase: string;
+    rpcHealthy: boolean;
+    rpcLatencyMs: number;
+  }> {
+    const startedAt = Date.now();
+
+    try {
+      await this.rpcClient.getHealth();
+      const latest = await this.rpcClient.getLatestLedger();
+
+      return {
+        latestLedger: latest.sequence,
+        networkPassphrase: this.networkPassphrase,
+        rpcHealthy: true,
+        rpcLatencyMs: Date.now() - startedAt,
+      };
+    } catch (error) {
+      this.logger.warn(`getNetworkStatus RPC check failed: ${error.message}`);
+      return {
+        latestLedger: null,
+        networkPassphrase: this.networkPassphrase,
+        rpcHealthy: false,
+        rpcLatencyMs: Date.now() - startedAt,
+      };
+    }
+  }
+
+  // ----------------------------------------------------------
+  // CONTRACT EXISTENCE CHECK
+  // ----------------------------------------------------------
+
+  /**
+   * Checks whether a Soroban contract is actually deployed at the given
+   * address, by reading its ledger-key-instance entry via getContractData.
+   * getContractData rejects when the entry isn't found, which is how we
+   * distinguish "no contract here" from a real RPC failure.
+   */
+  async contractExists(contractAddress: string): Promise<boolean> {
+    try {
+      await this.rpcClient.getContractData(
+        contractAddress,
+        xdr.ScVal.scvLedgerKeyContractInstance(),
+        SorobanRpc.Durability.Persistent,
+      );
+      return true;
+    } catch (error) {
+      if (error?.message?.toLowerCase().includes('not found')) {
+        return false;
+      }
+      this.logger.error(`contractExists(${contractAddress}) failed`, error.message);
+      throw error;
+    }
+  }
+
+  // ----------------------------------------------------------
+  // STREAMING SUBSCRIPTION
+  // ----------------------------------------------------------
+
+  /**
+   * Subscribes to contract events using a tight polling loop (1-second interval)
+   * that approximates real-time streaming from the Soroban RPC.
+   *
+   * @param startLedger - Ledger to begin scanning from
+   * @param onEvent     - Called for each new event in order
+   * @param onError     - Called when the loop encounters an RPC error
+   * @returns           - Unsubscribe function; call it to stop the loop
+   */
+  subscribeToContractEvents(
+    startLedger: number,
+    onEvent: (event: SorobanRpc.Api.EventResponse) => Promise<void>,
+    onError: (error: Error) => void,
+  ): () => void {
+    let active = true;
+    let currentLedger = startLedger;
+
+    const loop = async () => {
+      while (active) {
+        try {
+          const events = await this.fetchContractEvents(currentLedger);
+          for (const event of events) {
+            if (!active) return;
+            await onEvent(event);
+            currentLedger = Math.max(currentLedger, event.ledger + 1);
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, 1_000));
+        } catch (err) {
+          if (active) {
+            onError(err as Error);
+          }
+          return;
+        }
+      }
+    };
+
+    void loop();
+    return () => {
+      active = false;
+    };
+  }
+
+  /**
+   * Fetches the transaction's result meta from Soroban RPC and decodes
+   * any events emitted by our contract.
+   * Throws NotFoundException if the transaction is not found.
+   */
+  async getTransactionEvents(txHash: string): Promise<any[]> {
+    return withSpan(
+      'stellar.getTransactionEvents',
+      async (span) => {
+        span.setAttribute('stellar.tx_hash', txHash);
+        try {
+          const tx = await this.rpcClient.getTransaction(txHash);
+          if (tx.status === 'NOT_FOUND') {
+            throw new NotFoundException(`Transaction ${txHash} not found`);
+          }
+          if (tx.status !== 'SUCCESS') {
+            return [];
+          }
+          if (!tx.resultMetaXdr) {
+            return [];
+          }
+
+          const meta = tx.resultMetaXdr as any;
+          
+          let sorobanMeta: any;
+          if (meta.switch && meta.switch() === 3) {
+            sorobanMeta = meta.v3().sorobanMeta();
+          } else {
+            try {
+              sorobanMeta = meta.sorobanMeta();
+            } catch {}
+          }
+
+          if (!sorobanMeta) {
+            return [];
+          }
+
+          const events = sorobanMeta.events() ?? [];
+          const decodedEvents = [];
+
+          for (const e of events) {
+            const contractIdBuf = e.contractId();
+            if (!contractIdBuf) continue;
+
+            const contractAddress = StrKey.encodeContract(contractIdBuf);
+            if (contractAddress !== this.contractId) continue;
+
+            if (e.type().name !== 'contract' && e.type().value !== 0) continue;
+
+            const topics = e.body().v0().topics().map((t: any) => scValToNative(t));
+            const value = scValToNative(e.body().v0().data());
+
+            decodedEvents.push({
+              id: `${txHash}-${decodedEvents.length}`,
+              contractId: contractAddress,
+              type: 'contract',
+              topic: topics,
+              value: value,
+              ledger: tx.ledger,
+              txHash: txHash,
+            });
+          }
+
+          return decodedEvents;
+        } catch (error) {
+          if (error instanceof NotFoundException) {
+            throw error;
+          }
+          this.logger.error(`getTransactionEvents(${txHash}) failed: ${error.message}`);
+          throw error;
+        }
+      },
+      { 'stellar.rpc_url': this.config.get<string>('STELLAR_RPC_URL', '') },
+      SpanKind.CLIENT,
+    );
   }
 }

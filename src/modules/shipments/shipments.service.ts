@@ -7,24 +7,47 @@ import {
   BadRequestException,
   InternalServerErrorException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { createHash } from 'crypto';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { StellarService } from '../../common/stellar/stellar.service';
 import { TokenRegistryService } from '../../common/token-registry/token-registry.service';
 import { NotificationsService } from '../notifications/notifications.service';
-import { CreateShipmentDto } from './dto/create-shipment.dto';
+import { RedisService } from '../../common/redis/redis.service';
+import { MetricsService } from '../../common/metrics/metrics.service';
+import { AuditLogService } from '../audit-logs/audit-log.service';
+import { KycService } from '../kyc/kyc.service';
+import { ShipmentApprovalsService } from './shipment-approvals.service';
+import { FxRateService } from '../../common/fx/fx-rate.service';
+import { CreateShipmentDto, CloneShipmentDto } from './dto/create-shipment.dto';
+import { CreateTrackingDto } from './dto/tracking.dto';
 import { ShipmentStatus, NotificationType, ArbiterStatus } from '@prisma/client';
 import { nativeToScVal } from '@stellar/stellar-sdk';
+import { randomUUID } from 'crypto';
+import { parse } from 'csv-parse/sync';
+import Ajv from 'ajv';
+import { metadataSchemas } from './schemas/metadata.schemas';
 
 @Injectable()
 export class ShipmentsService {
   private readonly logger = new Logger(ShipmentsService.name);
+  private readonly cacheTtl: number;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly stellar: StellarService,
     private readonly tokenRegistry: TokenRegistryService,
     private readonly notifications: NotificationsService,
-  ) {}
+    private readonly redis: RedisService,
+    private readonly config: ConfigService,
+    private readonly metrics: MetricsService,
+    private readonly auditLog: AuditLogService,
+    private readonly kyc: KycService,
+    private readonly approvals: ShipmentApprovalsService,
+    private readonly fxRate: FxRateService,
+  ) {
+    this.cacheTtl = this.config.get<number>('SHIPMENTS_CACHE_TTL_SECONDS', 30);
+  }
 
   // ----------------------------------------------------------
   // CREATE — persist after tx is confirmed on-chain
@@ -104,11 +127,38 @@ export class ShipmentsService {
     }
     // ==========================================================
 
+    // KYC/AML gate — shipments at or above the configured value threshold
+    // require both buyer and supplier to be KYC-verified (#233).
+    const totalAmountBigInt = BigInt(dto.totalAmount);
+    if (this.kyc.meetsThreshold(totalAmountBigInt)) {
+      const [buyerVerified, supplierVerified] = await Promise.all([
+        this.kyc.isVerified(dto.buyerAddress),
+        this.kyc.isVerified(supplierAddress),
+      ]);
+      if (!buyerVerified || !supplierVerified) {
+        throw new ForbiddenException(
+          'This shipment value requires KYC verification. Both the buyer and supplier must complete KYC verification before a shipment of this size can be created.',
+        );
+      }
+    }
+
     const token = this.tokenRegistry.getToken(tokenAddress);
+    if (!token.enabled) {
+      throw new BadRequestException(`Token ${tokenAddress} is disabled and cannot be used for new shipments`);
+    }
+
+    // Multi-signature approval gate (#234). Rejects the field outright on
+    // shipments below the configured value threshold rather than dropping it
+    // silently, so a caller is never wrong about having gated a shipment.
+    const requiredApprovals = this.approvals.resolveRequiredApprovals(
+      dto.requiredApprovals,
+      totalAmountBigInt,
+    );
 
     const shipment = await this.prisma.shipment.create({
       data: {
         id: dto.shipmentId,
+        ...(requiredApprovals !== null ? { requiredApprovals } : {}),
         buyerAddress: dto.buyerAddress,
         supplierAddress,
         logisticsAddress,
@@ -116,7 +166,7 @@ export class ShipmentsService {
         tokenAddress,
         tokenDecimals: token.decimals,
         tokenSymbol: token.symbol,
-        totalAmount: BigInt(dto.totalAmount),
+        totalAmount: totalAmountBigInt,
         txHash: dto.txHash,
         description: dto.description,
         referenceNumber: dto.referenceNumber,
@@ -145,7 +195,10 @@ export class ShipmentsService {
     );
 
     this.logger.log(`Shipment created: ${shipment.id} — arbiter ${dto.arbiterAddress} notified`);
-    return this.serialize(shipment);
+    this.metrics.incrementShipmentsCreated();
+    this.metrics.incrementActiveShipments();
+    await this.invalidateUserCache(dto.buyerAddress);
+    return await this.serialize(shipment);
   }
 
   // ----------------------------------------------------------
@@ -160,12 +213,18 @@ export class ShipmentsService {
     tags?: string[];
     page?: number;
     limit?: number;
+    cursor?: string;
     createdAfter?: string;
     createdBefore?: string;
     updatedAfter?: string;
     updatedBefore?: string;
     callerStellarAddress?: string;
     isAdmin?: boolean;
+    includeArchived?: boolean;
+    search?: string;
+    isDraft?: boolean;
+    favorite?: boolean;
+    callerUserId?: string;
   }) {
     const {
       buyerAddress,
@@ -175,13 +234,23 @@ export class ShipmentsService {
       tags,
       page = 1,
       limit = 20,
+      cursor,
       createdAfter,
       createdBefore,
       updatedAfter,
       updatedBefore,
       callerStellarAddress,
       isAdmin = false,
+      includeArchived = false,
+      search,
+      isDraft,
+      favorite,
+      callerUserId,
     } = filters;
+
+    if (cursor && page && page !== 1) {
+      throw new BadRequestException('cursor and page are mutually exclusive');
+    }
 
     const where: any = {};
 
@@ -208,6 +277,21 @@ export class ShipmentsService {
       };
     }
 
+    if (!includeArchived) {
+      where.archivedAt = null;
+    }
+
+    if (isDraft !== undefined) {
+      where.isDraft = isDraft;
+    }
+
+    if (favorite === true) {
+      if (!callerUserId) {
+        throw new BadRequestException('Authentication required to filter favorites');
+      }
+      where.favorites = { some: { userId: callerUserId } };
+    }
+
     // Scope to shipments where the caller is a participant (buyer/supplier/logistics/arbiter)
     if (!isAdmin && callerStellarAddress) {
       where.AND = where.AND ?? [];
@@ -221,33 +305,337 @@ export class ShipmentsService {
       });
     }
 
-    const [shipments, total] = await this.prisma.$transaction([
-      this.prisma.shipment.findMany({
-        where,
-        include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
+    const favoriteInclude = callerUserId
+      ? { favorites: { where: { userId: callerUserId }, select: { id: true } } }
+      : {};
+
+    let shipments: any[];
+    let total: number | null = null;
+    let nextCursor: string | null = null;
+
+    if (search) {
+      const participantCondition =
+        !isAdmin && callerStellarAddress
+          ? `AND (buyer_address = $1 OR supplier_address = $1 OR logistics_address = $1 OR arbiter_address = $1)`
+          : '';
+      const participantParams =
+        !isAdmin && callerStellarAddress ? [callerStellarAddress] : [];
+
+      const query = `
+        SELECT * FROM shipments
+        WHERE (description_search @@ plainto_tsquery('english', $2) OR reference_number ILIKE '%' || $2 || '%')
+        ${participantCondition}
+        ORDER BY created_at DESC
+        LIMIT $3 OFFSET $4
+      `;
+
+      const countQuery = `
+        SELECT COUNT(*) FROM shipments
+        WHERE (description_search @@ plainto_tsquery('english', $2) OR reference_number ILIKE '%' || $2 || '%')
+        ${participantCondition}
+      `;
+
+      // Read-heavy list path — use replica when DATABASE_REPLICA_URL is set
+      const db = this.prisma.read;
+
+      shipments = await db.$queryRawUnsafe(
+        query,
+        ...participantParams,
+        search,
+        limit,
+        (page - 1) * limit,
+      );
+
+      const countResult = await db.$queryRawUnsafe(
+        countQuery,
+        ...participantParams,
+        search,
+      );
+      total = Number((countResult as any[])[0].count);
+
+      for (const s of shipments) {
+        s.milestones = await db.milestone.findMany({
+          where: { shipmentId: s.id },
+          orderBy: { milestoneIndex: 'asc' },
+        });
+        if (callerUserId) {
+          s.favorites = await this.prisma.shipmentFavorite.findMany({
+            where: { shipmentId: s.id, userId: callerUserId },
+            select: { id: true },
+          });
+        }
+      }
+    } else if (cursor) {
+      let decoded: { createdAt: string; id: string };
+      try {
+        decoded = JSON.parse(Buffer.from(cursor, 'base64').toString('utf-8'));
+      } catch {
+        throw new BadRequestException('Invalid cursor format');
+      }
+
+      const db = this.prisma.read;
+      shipments = await db.shipment.findMany({
+        where: { ...where, createdAt: { lte: new Date(decoded.createdAt) } },
+        include: {
+          milestones: { orderBy: { milestoneIndex: 'asc' } },
+          ...favoriteInclude,
+        },
         orderBy: { createdAt: 'desc' },
-        skip: (page - 1) * limit,
+        cursor: { id: decoded.id },
+        skip: 1,
         take: limit,
-      }),
-      this.prisma.shipment.count({ where }),
-    ]);
+      });
+
+      nextCursor =
+        shipments.length === limit
+          ? Buffer.from(
+              JSON.stringify({
+                createdAt: shipments[shipments.length - 1].createdAt.toISOString(),
+                id: shipments[shipments.length - 1].id,
+              }),
+            ).toString('base64')
+          : null;
+    } else {
+      const db = this.prisma.read;
+      [shipments, total] = await db.$transaction([
+        db.shipment.findMany({
+          where,
+          include: {
+            milestones: { orderBy: { milestoneIndex: 'asc' } },
+            ...favoriteInclude,
+          },
+          orderBy: { createdAt: 'desc' },
+          skip: (page - 1) * limit,
+          take: limit,
+        }),
+        db.shipment.count({ where }),
+      ]);
+    }
 
     return {
-      data: shipments.map((s) => this.serialize(s)),
-      meta: { total, page, limit, totalPages: Math.ceil(total / limit) },
+      data: await Promise.all(
+        shipments.map((s) => this.serialize(s, callerUserId)),
+      ),
+      meta: cursor
+        ? { nextCursor, limit }
+        : {
+            total,
+            page,
+            limit,
+            totalPages: total !== null ? Math.ceil(total / limit) : null,
+            nextCursor: null,
+          },
     };
   }
 
-  async findOne(id: string) {
-    const shipment = await this.prisma.shipment.findUnique({
+  async findOne(id: string, callerUserId?: string, precisionOverride?: number) {
+    const db = this.prisma.read;
+    const shipment = await db.shipment.findUnique({
       where: { id },
       include: {
         milestones: { orderBy: { milestoneIndex: 'asc' } },
         events: { orderBy: { ledger: 'desc' }, take: 20 },
+        trackingUpdates: { orderBy: { createdAt: 'asc' } },
+        approvals: { orderBy: { createdAt: 'asc' } },
+        ...(callerUserId
+          ? { favorites: { where: { userId: callerUserId }, select: { id: true } } }
+          : {}),
       },
     });
     if (!shipment) throw new NotFoundException(`Shipment ${id} not found`);
-    return this.serialize(shipment);
+    return this.serialize(shipment, callerUserId, precisionOverride);
+  }
+
+  /**
+   * List shipments moved to cold storage by the archival job.
+   * Always reads from primary so freshly archived rows are immediately visible.
+   */
+  async findArchived(filters: {
+    page?: number;
+    limit?: number;
+    callerStellarAddress?: string;
+    isAdmin?: boolean;
+    status?: ShipmentStatus;
+  }) {
+    const { page = 1, limit = 20, callerStellarAddress, isAdmin = false, status } = filters;
+    const where: any = {};
+
+    if (status) where.status = status;
+
+    if (!isAdmin && callerStellarAddress) {
+      where.OR = [
+        { buyerAddress: callerStellarAddress },
+        { supplierAddress: callerStellarAddress },
+        { logisticsAddress: callerStellarAddress },
+        { arbiterAddress: callerStellarAddress },
+      ];
+    }
+
+    const [rows, total] = await this.prisma.$transaction([
+      this.prisma.archivedShipment.findMany({
+        where,
+        orderBy: { archivedAt: 'desc' },
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+      this.prisma.archivedShipment.count({ where }),
+    ]);
+
+    return {
+      data: rows.map((row) => ({
+        ...(row.payload as object),
+        id: row.id,
+        status: row.status,
+        buyerAddress: row.buyerAddress,
+        supplierAddress: row.supplierAddress,
+        logisticsAddress: row.logisticsAddress,
+        arbiterAddress: row.arbiterAddress,
+        coldArchivedAt: row.archivedAt,
+        terminalAt: row.terminalAt,
+      })),
+      meta: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  }
+
+  async findArchivedOne(id: string, callerStellarAddress?: string, isAdmin = false) {
+    const row = await this.prisma.archivedShipment.findUnique({ where: { id } });
+    if (!row) throw new NotFoundException(`Archived shipment ${id} not found`);
+
+    if (
+      !isAdmin &&
+      callerStellarAddress &&
+      row.buyerAddress !== callerStellarAddress &&
+      row.supplierAddress !== callerStellarAddress &&
+      row.logisticsAddress !== callerStellarAddress &&
+      row.arbiterAddress !== callerStellarAddress
+    ) {
+      throw new ForbiddenException('Not a participant on this archived shipment');
+    }
+
+    return {
+      ...(row.payload as object),
+      id: row.id,
+      status: row.status,
+      coldArchivedAt: row.archivedAt,
+      terminalAt: row.terminalAt,
+    };
+  }
+
+  async bulkStatus(
+    ids: string[],
+    callerAddress: string,
+    isAdmin: boolean,
+  ): Promise<{ results: Record<string, ShipmentStatus> }> {
+    const where: any = { id: { in: ids } };
+
+    if (!isAdmin) {
+      where.OR = [
+        { buyerAddress: callerAddress },
+        { supplierAddress: callerAddress },
+        { logisticsAddress: callerAddress },
+        { arbiterAddress: callerAddress },
+      ];
+    }
+
+    const shipments = await this.prisma.shipment.findMany({
+      where,
+      select: { id: true, status: true },
+    });
+
+    const results: Record<string, ShipmentStatus> = {};
+    for (const s of shipments) {
+      results[s.id] = s.status;
+    }
+    return { results };
+  }
+
+  async addNote(shipmentId: string, authorId: string, body: string) {
+    const shipment = await this.prisma.shipment.findUnique({ where: { id: shipmentId } });
+    if (!shipment) {
+      throw new NotFoundException(`Shipment ${shipmentId} not found`);
+    }
+
+    const note = await this.prisma.shipmentNote.create({
+      data: {
+        shipmentId,
+        authorId,
+        body,
+      },
+    });
+
+    await this.auditLog.record({
+      actorId: authorId,
+      actorAddress: '',
+      action: 'shipment.note_added',
+      resourceType: 'Shipment',
+      resourceId: shipmentId,
+      metadata: { noteId: note.id },
+    });
+
+    return note;
+  }
+
+  async listNotes(shipmentId: string) {
+    const shipment = await this.prisma.shipment.findUnique({ where: { id: shipmentId } });
+    if (!shipment) {
+      throw new NotFoundException(`Shipment ${shipmentId} not found`);
+    }
+
+    return this.prisma.shipmentNote.findMany({
+      where: { shipmentId },
+      orderBy: { createdAt: 'desc' },
+      include: {
+        author: {
+          select: {
+            id: true,
+            name: true,
+            stellarAddress: true,
+          },
+        },
+      },
+    });
+  }
+
+  async getRoleSummary(stellarAddress: string): Promise<{
+    asBuyer: number;
+    asSupplier: number;
+    asLogistics: number;
+    asArbiter: number;
+    total: number;
+  }> {
+    const activeWhere = { status: ShipmentStatus.ACTIVE };
+
+    const [asBuyer, asSupplier, asLogistics, asArbiter, shipmentIds] = await Promise.all([
+      this.prisma.shipment.count({ where: { ...activeWhere, buyerAddress: stellarAddress } }),
+      this.prisma.shipment.count({ where: { ...activeWhere, supplierAddress: stellarAddress } }),
+      this.prisma.shipment.count({ where: { ...activeWhere, logisticsAddress: stellarAddress } }),
+      this.prisma.shipment.count({ where: { ...activeWhere, arbiterAddress: stellarAddress } }),
+      this.prisma.shipment.findMany({
+        where: {
+          ...activeWhere,
+          OR: [
+            { buyerAddress: stellarAddress },
+            { supplierAddress: stellarAddress },
+            { logisticsAddress: stellarAddress },
+            { arbiterAddress: stellarAddress },
+          ],
+        },
+        select: { id: true },
+      }),
+    ]);
+
+    return {
+      asBuyer,
+      asSupplier,
+      asLogistics,
+      asArbiter,
+      total: new Set(shipmentIds.map((shipment) => shipment.id)).size,
+    };
   }
 
   /**
@@ -296,7 +684,175 @@ export class ShipmentsService {
     });
 
     this.logger.log(`Shipment updated: ${id}`);
-    return this.serialize(updated);
+    await this.invalidateUserCache(buyerAddress);
+    return await this.serialize(updated);
+  }
+
+  async replaceTags(
+    id: string,
+    tags: string[] | undefined,
+    callerAddress?: string,
+    callerId?: string,
+  ) {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id },
+      select: { id: true, tags: true },
+    });
+
+    if (!shipment) {
+      throw new NotFoundException(`Shipment ${id} not found`);
+    }
+
+    if (!Array.isArray(tags)) {
+      throw new BadRequestException('tags must be an array');
+    }
+
+    const normalizedTags = new Map<string, string>();
+    for (const tag of tags) {
+      if (typeof tag !== 'string') {
+        throw new BadRequestException('each tag must be a string');
+      }
+
+      const trimmed = tag.trim();
+      if (trimmed.length < 1 || trimmed.length > 30) {
+        throw new BadRequestException('each tag must be between 1 and 30 characters');
+      }
+
+      const key = trimmed.toLowerCase();
+      if (!normalizedTags.has(key)) {
+        normalizedTags.set(key, trimmed);
+      }
+    }
+
+    if (normalizedTags.size > 20) {
+      throw new BadRequestException('A shipment can have at most 20 tags');
+    }
+
+    const nextTags = Array.from(normalizedTags.values());
+
+    const updated = await this.prisma.shipment.update({
+      where: { id },
+      data: { tags: nextTags },
+      include: {
+        milestones: { orderBy: { milestoneIndex: 'asc' } },
+        events: { orderBy: { ledger: 'desc' }, take: 20 },
+      },
+    });
+
+    await this.auditLog.record({
+      actorId: callerId,
+      actorAddress: callerAddress ?? 'unknown',
+      action: 'SHIPMENT_TAGS_REPLACED',
+      resourceType: 'Shipment',
+      resourceId: id,
+      metadata: {
+        previousTags: shipment.tags,
+        nextTags,
+      },
+    });
+
+    this.logger.log(`Shipment tags replaced: ${id}`);
+    return await this.serialize(updated);
+  }
+
+  // ----------------------------------------------------------
+  // TAGS — atomic add/remove
+  // ----------------------------------------------------------
+
+  /**
+   * Atomically add a tag to a shipment.
+   * Only the buyer can add tags, and only when shipment is ACTIVE.
+   * Uses Prisma `push` for atomic append at the DB level.
+   */
+  async addTag(id: string, buyerAddress: string, tag: string) {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id },
+      select: { buyerAddress: true, status: true, tags: true },
+    });
+
+    if (!shipment) {
+      throw new NotFoundException(`Shipment ${id} not found`);
+    }
+
+    if (shipment.buyerAddress !== buyerAddress) {
+      throw new ForbiddenException('Only the shipment buyer can modify tags');
+    }
+
+    if (shipment.status !== ShipmentStatus.ACTIVE) {
+      throw new ConflictException(`Shipment is not ACTIVE (current status: ${shipment.status})`);
+    }
+
+    // Check if tag already exists
+    if (shipment.tags.includes(tag)) {
+      throw new ConflictException(`Tag "${tag}" already exists on shipment ${id}`);
+    }
+
+    // Atomic append using Prisma push
+    const updated = await this.prisma.shipment.update({
+      where: { id },
+      data: {
+        tags: {
+          push: [tag],
+        },
+      },
+      include: {
+        milestones: { orderBy: { milestoneIndex: 'asc' } },
+        events: { orderBy: { ledger: 'desc' }, take: 20 },
+      },
+    });
+
+    this.logger.log(`Tag "${tag}" added to shipment ${id} by buyer ${buyerAddress}`);
+    await this.invalidateUserCache(buyerAddress);
+    return await this.serialize(updated);
+  }
+
+  /**
+   * Atomically remove a tag from a shipment.
+   * Only the buyer can remove tags, and only when shipment is ACTIVE.
+   * Uses PostgreSQL array_remove via $executeRaw for atomic removal.
+   */
+  async removeTag(id: string, buyerAddress: string, tag: string) {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id },
+      select: { buyerAddress: true, status: true, tags: true },
+    });
+
+    if (!shipment) {
+      throw new NotFoundException(`Shipment ${id} not found`);
+    }
+
+    if (shipment.buyerAddress !== buyerAddress) {
+      throw new ForbiddenException('Only the shipment buyer can modify tags');
+    }
+
+    if (shipment.status !== ShipmentStatus.ACTIVE) {
+      throw new ConflictException(`Shipment is not ACTIVE (current status: ${shipment.status})`);
+    }
+
+    // Check if tag exists
+    if (!shipment.tags.includes(tag)) {
+      throw new NotFoundException(`Tag "${tag}" not found on shipment ${id}`);
+    }
+
+    // Atomic removal using PostgreSQL array_remove
+    await this.prisma.$executeRaw`
+      UPDATE shipments 
+      SET tags = array_remove(tags, ${tag})
+      WHERE id = ${id}
+    `;
+
+    // Fetch the updated shipment
+    const updated = await this.prisma.shipment.findUnique({
+      where: { id },
+      include: {
+        milestones: { orderBy: { milestoneIndex: 'asc' } },
+        events: { orderBy: { ledger: 'desc' }, take: 20 },
+      },
+    });
+
+    this.logger.log(`Tag "${tag}" removed from shipment ${id} by buyer ${buyerAddress}`);
+    await this.invalidateUserCache(buyerAddress);
+    return await this.serialize(updated);
   }
 
   // ----------------------------------------------------------
@@ -405,7 +961,7 @@ export class ShipmentsService {
     );
 
     this.logger.log(`Arbiter ${callerAddress} accepted assignment for shipment ${id}`);
-    return this.serialize(updated);
+    return await this.serialize(updated);
   }
 
   /**
@@ -445,7 +1001,603 @@ export class ShipmentsService {
     );
 
     this.logger.log(`Arbiter ${callerAddress} declined assignment for shipment ${id}`);
-    return this.serialize(updated);
+    return await this.serialize(updated);
+  }
+
+  // ----------------------------------------------------------
+  // CANCEL — buyer registers on-chain cancellation
+  // ----------------------------------------------------------
+
+  async cancel(id: string, buyerAddress: string, txHash: string) {
+    const shipment = await this.prisma.shipment.findUnique({ where: { id } });
+    if (!shipment) throw new NotFoundException(`Shipment ${id} not found`);
+    if (shipment.buyerAddress !== buyerAddress) {
+      throw new ForbiddenException('Only the shipment buyer can cancel it');
+    }
+    if (shipment.status !== ShipmentStatus.ACTIVE) {
+      throw new ConflictException(`Shipment is not ACTIVE (current status: ${shipment.status})`);
+    }
+
+    const updated = await this.prisma.shipment.update({
+      where: { id },
+      data: {
+        status: ShipmentStatus.CANCELLED,
+        txHash,
+        cancelledAt: new Date(),
+        refundTxHash: txHash || undefined,
+      },
+      include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
+    });
+
+    this.logger.log(`Shipment ${id} cancelled by buyer ${buyerAddress}`);
+    this.metrics.decrementActiveShipments();
+    await this.invalidateUserCache(buyerAddress);
+    
+    await this.notifications.notifyWatchers(
+      id,
+      NotificationType.SHIPMENT_CANCELLED,
+      'Shipment Cancelled',
+      `Shipment ${id} has been cancelled.`,
+      { shipmentId: id }
+    );
+
+    return await this.serialize(updated);
+  }
+
+  // ----------------------------------------------------------
+  // REFUND DETAIL
+  // ----------------------------------------------------------
+
+  /**
+   * Returns refund details for a cancelled shipment.
+   * Looks up the shipment_cancelled ChainEvent to extract the refunded amount.
+   */
+  async getRefundDetail(id: string) {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id },
+    });
+
+    if (!shipment) {
+      throw new NotFoundException(`Shipment ${id} not found`);
+    }
+
+    if (!shipment.cancelledAt) {
+      throw new NotFoundException(`Shipment ${id} has not been cancelled`);
+    }
+
+    // Look up the corresponding ChainEvent for refund amount
+    const cancelEvent = await this.prisma.chainEvent.findFirst({
+      where: {
+        shipmentId: id,
+        eventName: 'shipment_cancelled',
+      },
+      orderBy: { ledger: 'desc' },
+    });
+
+    if (!cancelEvent) {
+      throw new InternalServerErrorException(
+        `Cancellation chain event not found for shipment ${id}. The on-chain event may not have been processed yet.`,
+      );
+    }
+
+    // Extract refunded amount from the event payload.
+    // Payload is expected to be [shipmentId, refundedAmount].
+    // Falls back to totalAmount if payload doesn't include amount.
+    let refundedAmountRaw: bigint;
+    try {
+      const payload = cancelEvent.payload as any;
+      if (Array.isArray(payload) && payload.length >= 2) {
+        refundedAmountRaw = BigInt(payload[1] ?? 0);
+      } else {
+        refundedAmountRaw = shipment.totalAmount;
+      }
+    } catch {
+      this.logger.warn(
+        `Failed to parse refund amount from payload for shipment ${id}, falling back to totalAmount`,
+      );
+      refundedAmountRaw = shipment.totalAmount;
+    }
+
+    const decimals: number = shipment.tokenDecimals ?? 7;
+
+    return {
+      cancelledAt: shipment.cancelledAt.toISOString(),
+      refundTxHash: shipment.refundTxHash ?? cancelEvent.txHash,
+      refundedAmount: this.stellar.toHumanAmount(refundedAmountRaw, decimals),
+      refundedTo: shipment.buyerAddress,
+    };
+  }
+
+  // ----------------------------------------------------------
+  // CLONE — copy structure into a new ACTIVE shipment
+  // ----------------------------------------------------------
+
+  async clone(id: string, buyerAddress: string, dto: CloneShipmentDto) {
+    const source = await this.prisma.shipment.findUnique({
+      where: { id },
+      include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
+    });
+
+    if (!source) throw new NotFoundException(`Shipment ${id} not found`);
+
+    if (source.buyerAddress !== buyerAddress) {
+      throw new ForbiddenException('Only the original shipment buyer can clone it');
+    }
+
+    const token = this.tokenRegistry.getToken(source.tokenAddress);
+    const newId = randomUUID();
+
+    const cloned = await this.prisma.shipment.create({
+      data: {
+        id: newId,
+        buyerAddress: source.buyerAddress,
+        supplierAddress: source.supplierAddress,
+        logisticsAddress: source.logisticsAddress,
+        arbiterAddress: source.arbiterAddress,
+        tokenAddress: source.tokenAddress,
+        tokenDecimals: token.decimals,
+        tokenSymbol: token.symbol,
+        totalAmount: BigInt(dto.totalAmount),
+        txHash: dto.txHash,
+        description: source.description,
+        metadata: source.metadata ?? undefined,
+        tags: source.tags,
+        status: ShipmentStatus.ACTIVE,
+        arbiterStatus: ArbiterStatus.PENDING_ACCEPTANCE,
+        milestones: {
+          create: source.milestones.map((m, index) => ({
+            milestoneIndex: index,
+            name: m.name,
+            paymentPercent: m.paymentPercent,
+          })),
+        },
+      },
+      include: { milestones: true },
+    });
+
+    await this.notifications.notifyUser(
+      source.arbiterAddress,
+      NotificationType.ARBITER_INVITED,
+      'Arbiter assignment invitation',
+      `You have been assigned as arbiter for shipment ${cloned.id}. Please accept or decline this assignment.`,
+      { shipmentId: cloned.id, buyerAddress: source.buyerAddress, supplierAddress: source.supplierAddress },
+    );
+
+    this.logger.log(`Shipment ${id} cloned to ${cloned.id} by buyer ${buyerAddress}`);
+    return await this.serialize(cloned);
+  }
+
+  // ----------------------------------------------------------
+  // ARCHIVE / UNARCHIVE — hide completed/cancelled shipments
+  // ----------------------------------------------------------
+
+  async archive(id: string, buyerAddress: string) {
+    const shipment = await this.prisma.shipment.findUnique({ where: { id } });
+    if (!shipment) throw new NotFoundException(`Shipment ${id} not found`);
+    if (shipment.buyerAddress !== buyerAddress) {
+      throw new ForbiddenException('Only the shipment buyer can archive it');
+    }
+    if (shipment.status === ShipmentStatus.ACTIVE) {
+      throw new ConflictException('Only COMPLETED or CANCELLED shipments can be archived');
+    }
+    if (shipment.archivedAt) {
+      throw new ConflictException('Shipment is already archived');
+    }
+
+    const updated = await this.prisma.shipment.update({
+      where: { id },
+      data: { archivedAt: new Date() },
+      include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
+    });
+
+    this.logger.log(`Shipment ${id} archived by buyer ${buyerAddress}`);
+    
+    await this.notifications.notifyWatchers(
+      id,
+      NotificationType.SYSTEM_ALERT,
+      'Shipment Archived',
+      `Shipment ${id} has been archived.`,
+      { shipmentId: id }
+    );
+
+    return await this.serialize(updated);
+  }
+
+  async unarchive(id: string, buyerAddress: string) {
+    const shipment = await this.prisma.shipment.findUnique({ where: { id } });
+    if (!shipment) throw new NotFoundException(`Shipment ${id} not found`);
+    if (shipment.buyerAddress !== buyerAddress) {
+      throw new ForbiddenException('Only the shipment buyer can unarchive it');
+    }
+    if (!shipment.archivedAt) {
+      throw new ConflictException('Shipment is not archived');
+    }
+
+    const updated = await this.prisma.shipment.update({
+      where: { id },
+      data: { archivedAt: null },
+      include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
+    });
+
+    this.logger.log(`Shipment ${id} unarchived by buyer ${buyerAddress}`);
+    return await this.serialize(updated);
+  }
+
+  // ----------------------------------------------------------
+  // MY ROLE — return the caller's participant role
+  // ----------------------------------------------------------
+
+  async getCallerRole(id: string, stellarAddress: string, isAdmin: boolean) {
+    if (isAdmin) return { role: 'ADMIN' };
+
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id },
+      select: {
+        buyerAddress: true,
+        supplierAddress: true,
+        logisticsAddress: true,
+        arbiterAddress: true,
+      },
+    });
+
+    if (!shipment) throw new NotFoundException(`Shipment ${id} not found`);
+
+    if (stellarAddress === shipment.buyerAddress) return { role: 'BUYER' };
+    if (stellarAddress === shipment.supplierAddress) return { role: 'SUPPLIER' };
+    if (stellarAddress === shipment.logisticsAddress) return { role: 'LOGISTICS' };
+    if (stellarAddress === shipment.arbiterAddress) return { role: 'ARBITER' };
+
+    return { role: null };
+  }
+
+  // ----------------------------------------------------------
+  // METADATA VALIDATION
+  // ----------------------------------------------------------
+
+  async validateMetadata(id: string, schemaKey: 'incoterms' | 'customs') {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id },
+      select: { metadata: true },
+    });
+
+    if (!shipment) {
+      throw new NotFoundException(`Shipment ${id} not found`);
+    }
+
+    if (!shipment.metadata) {
+      throw new NotFoundException(`Shipment ${id} has no metadata set`);
+    }
+
+    const ajv = new Ajv({ allErrors: true });
+    const schema = metadataSchemas[schemaKey];
+    const validate = ajv.compile(schema);
+    const valid = validate(shipment.metadata);
+
+    if (valid) {
+      return { valid: true, errors: [] };
+    }
+
+    const errors = validate.errors?.map((err) => ({
+      path: err.instancePath,
+      message: err.message,
+    })) || [];
+
+    return { valid: false, errors };
+  }
+
+  // ----------------------------------------------------------
+  // FAVORITES
+  // ----------------------------------------------------------
+
+  async favoriteShipment(shipmentId: string, userId: string) {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id: shipmentId },
+    });
+    if (!shipment) throw new NotFoundException(`Shipment ${shipmentId} not found`);
+
+    const existing = await this.prisma.shipmentFavorite.findFirst({
+      where: { shipmentId, userId },
+    });
+
+    if (!existing) {
+      await this.prisma.shipmentFavorite.create({
+        data: { shipmentId, userId },
+      });
+    }
+
+    return { favorited: true, shipmentId, userId };
+  }
+
+  async unfavoriteShipment(shipmentId: string, userId: string) {
+    await this.prisma.shipmentFavorite.deleteMany({
+      where: { shipmentId, userId },
+    });
+
+    return { unfavorited: true };
+  }
+
+  // ----------------------------------------------------------
+  // WATCHERS
+  // ----------------------------------------------------------
+
+  async watchShipment(shipmentId: string, stellarAddress: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { stellarAddress },
+    });
+    if (!user) throw new NotFoundException('User not found');
+
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id: shipmentId },
+    });
+    if (!shipment) throw new NotFoundException(`Shipment ${shipmentId} not found`);
+
+    const existing = await this.prisma.shipmentWatcher.findFirst({
+      where: { shipmentId, userId: user.id },
+    });
+
+    if (!existing) {
+      await this.prisma.shipmentWatcher.create({
+        data: { shipmentId, userId: user.id },
+      });
+    }
+
+    return { watched: true, shipmentId, userId: user.id };
+  }
+
+  async unwatchShipment(shipmentId: string, stellarAddress: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { stellarAddress },
+    });
+    if (!user) return { unwatched: true }; // No user, so they aren't watching
+
+    await this.prisma.shipmentWatcher.deleteMany({
+      where: { shipmentId, userId: user.id },
+    });
+
+    return { unwatched: true };
+  }
+
+  async getWatchers(shipmentId: string) {
+    const watchers = await this.prisma.shipmentWatcher.findMany({
+      where: { shipmentId },
+      include: {
+        user: { select: { id: true, stellarAddress: true, name: true, role: true } },
+      },
+    });
+    return watchers.map(w => w.user);
+  }
+
+  // ----------------------------------------------------------
+  // TRACKING UPDATES — logistics participant submits location/status
+  // ----------------------------------------------------------
+
+  /**
+   * Create a tracking update for a shipment.
+   * Only the logistics participant can submit tracking updates.
+   * Tracking updates are immutable after submission.
+   */
+  async createTracking(
+    shipmentId: string,
+    callerAddress: string,
+    dto: CreateTrackingDto,
+  ) {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id: shipmentId },
+      select: { logisticsAddress: true, buyerAddress: true, supplierAddress: true, id: true },
+    });
+
+    if (!shipment) {
+      throw new ForbiddenException(`Shipment ${shipmentId} not found`);
+    }
+
+    if (shipment.logisticsAddress !== callerAddress) {
+      throw new ForbiddenException('Only the logistics participant can submit tracking updates');
+    }
+
+    const trackingUpdate = await this.prisma.trackingUpdate.create({
+      data: {
+        shipmentId: shipment.id,
+        submittedBy: callerAddress,
+        location: dto.location,
+        ...(dto.latitude !== undefined ? { latitude: dto.latitude } : {}),
+        ...(dto.longitude !== undefined ? { longitude: dto.longitude } : {}),
+        status: dto.status,
+        ...(dto.estimatedArrival ? { estimatedArrival: new Date(dto.estimatedArrival) } : {}),
+        ...(dto.notes !== undefined ? { notes: dto.notes } : {}),
+      },
+    });
+
+    // Notify buyer and supplier
+    const etaText = trackingUpdate.estimatedArrival
+      ? ` ETA: ${trackingUpdate.estimatedArrival.toISOString()}`
+      : '';
+    const notificationMessage = `Logistics update: ${trackingUpdate.status} at ${trackingUpdate.location}.${etaText}`;
+
+    await this.notifications.notifyUser(
+      shipment.buyerAddress,
+      NotificationType.TRACKING_UPDATED,
+      'Shipment tracking update',
+      notificationMessage,
+      {
+        shipmentId: shipment.id,
+        status: trackingUpdate.status,
+        location: trackingUpdate.location,
+        estimatedArrival: trackingUpdate.estimatedArrival?.toISOString() ?? null,
+      },
+    );
+
+    await this.notifications.notifyUser(
+      shipment.supplierAddress,
+      NotificationType.TRACKING_UPDATED,
+      'Shipment tracking update',
+      notificationMessage,
+      {
+        shipmentId: shipment.id,
+        status: trackingUpdate.status,
+        location: trackingUpdate.location,
+        estimatedArrival: trackingUpdate.estimatedArrival?.toISOString() ?? null,
+      },
+    );
+
+    this.logger.log(`Tracking update created for shipment ${shipmentId} by ${callerAddress}: ${trackingUpdate.status} at ${trackingUpdate.location}`);
+    return trackingUpdate;
+  }
+
+  /**
+   * Get all tracking updates for a shipment in chronological order.
+   * Restricted to shipment participants.
+   */
+  async getTracking(shipmentId: string, callerAddress: string) {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id: shipmentId },
+      select: { buyerAddress: true, supplierAddress: true, logisticsAddress: true, arbiterAddress: true },
+    });
+
+    if (!shipment) {
+      throw new ForbiddenException(`Shipment ${shipmentId} not found`);
+    }
+
+    const isParticipant =
+      callerAddress === shipment.buyerAddress ||
+      callerAddress === shipment.supplierAddress ||
+      callerAddress === shipment.logisticsAddress ||
+      callerAddress === shipment.arbiterAddress;
+
+    if (!isParticipant) {
+      throw new ForbiddenException('Not authorized to view tracking updates for this shipment');
+    }
+
+    const trackingUpdates = await this.prisma.trackingUpdate.findMany({
+      where: { shipmentId },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    return trackingUpdates;
+  }
+
+  // ----------------------------------------------------------
+  // PARTICIPANTS
+  // ----------------------------------------------------------
+
+  async getParticipants(shipmentId: string) {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id: shipmentId },
+      select: {
+        buyerAddress: true,
+        supplierAddress: true,
+        logisticsAddress: true,
+        arbiterAddress: true,
+        arbiterStatus: true,
+        buyer: { select: { name: true } },
+        supplier: { select: { name: true } },
+        logistics: { select: { name: true } },
+        arbiter: { select: { name: true } },
+      },
+    });
+
+    if (!shipment) throw new NotFoundException(`Shipment ${shipmentId} not found`);
+
+    return [
+      { role: 'BUYER', stellarAddress: shipment.buyerAddress, name: shipment.buyer.name ?? null },
+      { role: 'SUPPLIER', stellarAddress: shipment.supplierAddress, name: shipment.supplier.name ?? null },
+      { role: 'LOGISTICS', stellarAddress: shipment.logisticsAddress, name: shipment.logistics.name ?? null },
+      { role: 'ARBITER', stellarAddress: shipment.arbiterAddress, name: shipment.arbiter.name ?? null, arbiterStatus: shipment.arbiterStatus },
+    ];
+  }
+
+  // ----------------------------------------------------------
+  // ADMIN — force resync bypassing participant guard
+  // ----------------------------------------------------------
+
+  /**
+   * Admin-only resync of a shipment from chain, bypassing the participant
+   * ownership check. Reuses the same chain-read logic as the
+   * participant-facing sync endpoint, then writes an audit log entry
+   * since this bypasses the normal ownership guard.
+   */
+  async adminForceSync(shipmentId: string, adminUserId: string, adminAddress: string) {
+    await this.syncStatusFromChain(shipmentId);
+
+    await this.auditLog.record({
+      actorId: adminUserId,
+      actorAddress: adminAddress,
+      action: 'ADMIN_FORCE_SYNC',
+      resourceType: 'Shipment',
+      resourceId: shipmentId,
+      metadata: { adminUserId, shipmentId },
+    });
+
+    this.logger.log(`Shipment ${shipmentId} force-synced by admin ${adminUserId}`);
+    return this.findOne(shipmentId);
+  }
+
+  // ----------------------------------------------------------
+  // ADMIN — find shipments with no recent milestone activity
+  // ----------------------------------------------------------
+
+  /**
+   * Finds ACTIVE shipments where the most recent milestone update (or the
+   * shipment's own updatedAt, when it has no milestones) is older than
+   * `minDays` days. Used by admins to surface shipments that look
+   * abandoned so they can follow up.
+   */
+  async findStuckShipments(minDays: number, page = 1, limit = 20) {
+    const offset = (page - 1) * limit;
+
+    const rows = await this.prisma.$queryRaw<
+      Array<{
+        id: string;
+        buyerAddress: string;
+        supplierAddress: string;
+        lastActivityAt: Date;
+      }>
+    >`
+      SELECT
+        s.id,
+        s."buyerAddress"    AS "buyerAddress",
+        s."supplierAddress" AS "supplierAddress",
+        COALESCE(MAX(m."updatedAt"), s."updatedAt") AS "lastActivityAt"
+      FROM shipments s
+      LEFT JOIN milestones m ON m."shipmentId" = s.id
+      WHERE s.status = 'ACTIVE'
+      GROUP BY s.id
+      HAVING COALESCE(MAX(m."updatedAt"), s."updatedAt") < now() - make_interval(days => ${minDays})
+      ORDER BY "lastActivityAt" ASC
+      LIMIT ${limit} OFFSET ${offset}
+    `;
+
+    const countResult = await this.prisma.$queryRaw<Array<{ count: bigint }>>`
+      SELECT COUNT(*)::bigint AS count
+      FROM (
+        SELECT s.id
+        FROM shipments s
+        LEFT JOIN milestones m ON m."shipmentId" = s.id
+        WHERE s.status = 'ACTIVE'
+        GROUP BY s.id
+        HAVING COALESCE(MAX(m."updatedAt"), s."updatedAt") < now() - make_interval(days => ${minDays})
+      ) sub
+    `;
+
+    const total = Number(countResult[0]?.count ?? 0);
+    const now = Date.now();
+
+    const data = rows.map((r) => ({
+      id: r.id,
+      buyerAddress: r.buyerAddress,
+      supplierAddress: r.supplierAddress,
+      lastActivityAt: r.lastActivityAt.toISOString(),
+      daysSinceActivity: Math.floor((now - r.lastActivityAt.getTime()) / 86_400_000),
+    }));
+
+    return {
+      data,
+      meta: {
+        total,
+        page,
+        limit,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
   }
 
   // ----------------------------------------------------------
@@ -501,7 +1653,7 @@ export class ShipmentsService {
       this.logger.log(
         `Synced shipment ${shipmentId} from chain: status=${mappedStatus}, releasedAmount=${releasedAmount}`
       );
-    } catch (error) {
+    } catch (error: any) {
       // Check if it's a "shipment not found in DB" error
       if (error.code === 'P2025') {
         this.logger.warn(
@@ -643,25 +1795,390 @@ export class ShipmentsService {
     });
   }
 
+  async exportOnePdf(id: string): Promise<Buffer> {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id },
+      include: {
+        milestones: { orderBy: { milestoneIndex: 'asc' } },
+        events: { orderBy: { ledger: 'desc' }, take: 50 },
+        comments: { where: { visibility: 'ALL' }, orderBy: { createdAt: 'asc' } },
+      },
+    });
+    if (!shipment) throw new NotFoundException(`Shipment ${id} not found`);
+
+    return new Promise((resolve, reject) => {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const PDFDocument = require('pdfkit');
+      const doc = new PDFDocument({ margin: 40, size: 'A4' });
+      const chunks: Buffer[] = [];
+      doc.on('data', (c: Buffer) => chunks.push(c));
+      doc.on('end', () => resolve(Buffer.concat(chunks)));
+      doc.on('error', reject);
+
+      const decimals = 7;
+      const toUsdc = (raw: bigint) =>
+        this.stellar.toHumanAmount(raw ?? 0n, decimals);
+
+      doc.fontSize(18).text('ChainSettle — Shipment Export', { align: 'center' });
+      doc.fontSize(10).text(`Generated: ${new Date().toISOString()}`, { align: 'center' });
+      doc.moveDown();
+
+      doc.fontSize(13).text(`Shipment: ${shipment.id}`, { underline: true });
+      doc.fontSize(9);
+
+      const participants = [
+        ['Buyer', shipment.buyerAddress],
+        ['Supplier', shipment.supplierAddress],
+        ['Logistics', shipment.logisticsAddress],
+        ['Arbiter', shipment.arbiterAddress],
+      ];
+      for (const [role, addr] of participants) {
+        doc.text(`${role}: ${addr}`);
+      }
+
+      doc.moveDown(0.5);
+      doc.text(`Status: ${shipment.status}   Total: ${toUsdc(shipment.totalAmount)} USDC   Released: ${toUsdc(shipment.releasedAmount)} USDC`);
+      doc.text(`Created: ${shipment.createdAt?.toISOString() ?? ''}`);
+
+      if (shipment.milestones?.length) {
+        doc.moveDown(0.5).fontSize(10).text('Milestones:', { underline: true });
+        doc.fontSize(9);
+        for (const m of shipment.milestones) {
+          doc.text(
+            `  [${m.milestoneIndex}] ${m.name} — ${m.paymentPercent}% — ${m.status}` +
+            (m.confirmedAt ? ` — confirmed ${m.confirmedAt.toISOString()}` : '') +
+            (m.proofHash ? ` — Proof: ${m.proofHash}` : ''),
+          );
+        }
+      }
+
+      if (shipment.events?.length) {
+        doc.moveDown(0.5).fontSize(10).text('Chain Events:', { underline: true });
+        doc.fontSize(9);
+        for (const e of shipment.events) {
+          doc.text(`  [${e.ledger}] ${e.eventName} — ${e.txHash}`);
+        }
+      }
+
+      if (shipment.comments?.length) {
+        doc.moveDown(0.5).fontSize(10).text('Comments:', { underline: true });
+        doc.fontSize(9);
+        for (const c of shipment.comments) {
+          doc.text(`  [${c.createdAt.toISOString()}] ${c.authorId}: ${c.body}`);
+        }
+      }
+
+      doc.moveDown();
+      doc.fontSize(8).text(`Exported: ${new Date().toISOString()}`, { align: 'center' });
+
+      doc.end();
+    });
+  }
+
+  // ----------------------------------------------------------
+  // VALUE RELEASED OVER TIME — time series for charting
+  // ----------------------------------------------------------
+
+  async getPaymentTimeSeries(id: string) {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id },
+      select: {
+        totalAmount: true,
+        tokenDecimals: true,
+        tokenSymbol: true,
+      },
+    });
+    if (!shipment) throw new NotFoundException(`Shipment ${id} not found`);
+
+    const milestones = await this.prisma.milestone.findMany({
+      where: {
+        shipmentId: id,
+        status: { in: ['CONFIRMED', 'RESOLVED'] as any },
+        confirmedAt: { not: null },
+      },
+      orderBy: { confirmedAt: 'asc' },
+    });
+
+    const decimals: number = shipment.tokenDecimals ?? 7;
+    const totalAmount: bigint = shipment.totalAmount ?? 0n;
+
+    let cumulative = 0n;
+    const entries = milestones.map((m) => {
+      const amount: bigint = m.paymentReleased ?? 0n;
+      cumulative += amount;
+      const percentComplete =
+        totalAmount > 0n
+          ? Math.round(Number((cumulative * 10000n) / totalAmount)) / 100
+          : 0;
+
+      return {
+        milestoneIndex: m.milestoneIndex,
+        name: m.name,
+        releasedAt: m.confirmedAt!.toISOString(),
+        amount: this.stellar.toHumanAmount(amount, decimals),
+        cumulativeReleased: this.stellar.toHumanAmount(cumulative, decimals),
+        percentComplete,
+      };
+    });
+
+    const percentComplete =
+      totalAmount > 0n
+        ? Math.round(Number((cumulative * 10000n) / totalAmount)) / 100
+        : 0;
+
+    return {
+      entries,
+      summary: {
+        totalReleased: this.stellar.toHumanAmount(cumulative, decimals),
+        totalAmount: this.stellar.toHumanAmount(totalAmount, decimals),
+        percentComplete,
+        remainingAmount: this.stellar.toHumanAmount(
+          totalAmount > cumulative ? totalAmount - cumulative : 0n,
+          decimals,
+        ),
+      },
+    };
+  }
+
+  // ----------------------------------------------------------
+  // CSV BULK IMPORT — create draft shipments from CSV
+  // ----------------------------------------------------------
+
+  /**
+   * Parses a CSV buffer and creates draft shipment records.
+   * Each row is processed independently — a malformed row does not affect
+   * valid rows. The caller (buyer) is set as the buyerAddress for all rows.
+   *
+   * CSV columns (case-insensitive header):
+   *   supplierAddress, logisticsAddress, arbiterAddress, tokenAddress,
+   *   totalAmount, description, referenceNumber
+   *
+   * @returns Per-row result array with { row, status, shipmentId?, error? }
+   */
+  async importDrafts(
+    userId: string,
+    buyerAddress: string,
+    csvBuffer: Buffer,
+  ): Promise<{ results: Array<{ row: number; status: 'created' | 'error'; shipmentId?: string; error?: string }> }> {
+    const raw: string = csvBuffer.toString('utf-8').replace(/^\uFEFF/, ''); // strip BOM
+
+    const records: any[] = parse(raw, {
+      columns: true,
+      skip_empty_lines: true,
+      trim: true,
+      relax_column_count: true,
+      relax_quotes: true,
+    });
+
+    if (records.length > 100) {
+      throw new BadRequestException(
+        `CSV file has ${records.length} rows; maximum allowed is 100 rows per import.`,
+      );
+    }
+
+    const results: Array<{ row: number; status: 'created' | 'error'; shipmentId?: string; error?: string }> = [];
+    const tokenRegistry = this.tokenRegistry;
+
+    for (let i = 0; i < records.length; i++) {
+      const rowNum = i + 2; // 1-indexed + header row
+      const r = records[i];
+
+      try {
+        // Normalise header names (case-insensitive)
+        const supplierAddress = (r.supplierAddress ?? r.supplieraddress ?? '').trim();
+        const logisticsAddress = (r.logisticsAddress ?? r.logisticsaddress ?? '').trim();
+        const arbiterAddress = (r.arbiterAddress ?? r.arbiteraddress ?? '').trim();
+        const tokenAddress = (r.tokenAddress ?? r.tokenaddress ?? '').trim();
+        const totalAmount = (r.totalAmount ?? r.totalamount ?? '').trim();
+        const description = (r.description ?? '').trim();
+        const referenceNumber = (r.referenceNumber ?? r.referencenumber ?? '').trim();
+
+        // Validate required fields
+        if (!supplierAddress) throw new Error('supplierAddress is required');
+        if (!logisticsAddress) throw new Error('logisticsAddress is required');
+        if (!arbiterAddress) throw new Error('arbiterAddress is required');
+        if (!tokenAddress) throw new Error('tokenAddress is required');
+        if (!totalAmount) throw new Error('totalAmount is required');
+
+        // Validate totalAmount is a positive integer string
+        const amountMatch = totalAmount.match(/^\d+$/);
+        if (!amountMatch) {
+          throw new Error(`totalAmount must be a positive integer (got "${totalAmount}")`);
+        }
+        const amountBigInt = BigInt(totalAmount);
+        if (amountBigInt <= 0n) {
+          throw new Error(`totalAmount must be greater than 0 (got ${totalAmount})`);
+        }
+
+        // Validate description length
+        if (description && description.length > 1000) {
+          throw new Error('description must be at most 1000 characters');
+        }
+
+        // Check for duplicate referenceNumber
+        if (referenceNumber) {
+          const existing = await this.prisma.shipment.findUnique({
+            where: { referenceNumber },
+          });
+          if (existing) {
+            throw new Error(`referenceNumber "${referenceNumber}" is already in use by shipment ${existing.id}`);
+          }
+        }
+
+        // Resolve token metadata
+        let token: { decimals: number; symbol: string };
+        try {
+          token = tokenRegistry.getToken(tokenAddress);
+        } catch {
+          throw new Error(`Unknown tokenAddress "${tokenAddress}"`);
+        }
+
+        const shipmentId = randomUUID();
+
+        const shipment = await this.prisma.shipment.create({
+          data: {
+            id: shipmentId,
+            buyerAddress,
+            supplierAddress,
+            logisticsAddress,
+            arbiterAddress,
+            tokenAddress,
+            tokenDecimals: token.decimals,
+            tokenSymbol: token.symbol,
+            totalAmount: amountBigInt,
+            description: description || null,
+            referenceNumber: referenceNumber || null,
+            isDraft: true,
+            // Draft shipments have no txHash, createdLedger, milestones, or on-chain backing
+          },
+        });
+
+        results.push({
+          row: rowNum,
+          status: 'created',
+          shipmentId: shipment.id,
+        });
+      } catch (err: any) {
+        results.push({
+          row: rowNum,
+          status: 'error',
+          error: err.message || 'Unknown error',
+        });
+      }
+    }
+
+    await this.auditLog.record({
+      actorId: userId,
+      actorAddress: buyerAddress,
+      action: 'shipment.csv_import',
+      resourceType: 'Shipment',
+      resourceId: 'csv-import',
+      metadata: {
+        totalRows: records.length,
+        created: results.filter((r) => r.status === 'created').length,
+        errors: results.filter((r) => r.status === 'error').length,
+      },
+    });
+
+    this.logger.log(
+      `CSV import completed by buyer ${buyerAddress}: ` +
+        `${results.filter((r) => r.status === 'created').length} created, ` +
+        `${results.filter((r) => r.status === 'error').length} errors`,
+    );
+
+    return { results };
+  }
+
   // ----------------------------------------------------------
   // INTERNAL HELPERS
   // ----------------------------------------------------------
 
-  private serialize(shipment: any) {
+  private buildCacheKey(callerStellarAddress: string, filters: Record<string, any>): string {
+    const hash = createHash('sha256')
+      .update(JSON.stringify(filters))
+      .digest('hex')
+      .slice(0, 16);
+    return `shipments:${callerStellarAddress}:${hash}`;
+  }
+
+  private async invalidateUserCache(callerStellarAddress: string): Promise<void> {
+    await this.redis.delByPrefix(`shipments:${callerStellarAddress}:`);
+  }
+
+  private async serialize(shipment: any, callerUserId?: string, precisionOverride?: number) {
     const now = new Date();
     const decimals: number = shipment.tokenDecimals ?? 7;
     const symbol: string = shipment.tokenSymbol ?? 'USDC';
 
+    // Estimated USD value (#231) — omitted entirely when no rate is cached,
+    // never causes the response to fail.
+    const fxRate = await this.fxRate.getUsdRate(symbol);
+    // Default display currency is USD (the rate is always token → USD).
+    const displayCurrency = 'USD';
+    const estimatedUsdValue = fxRate
+      ? {
+          totalAmountUsd: this.fxRate.formatValue(
+            Number(this.stellar.toHumanAmount(shipment.totalAmount ?? 0n, decimals)),
+            fxRate.rate,
+            displayCurrency,
+            precisionOverride,
+          ),
+          releasedAmountUsd: this.fxRate.formatValue(
+            Number(this.stellar.toHumanAmount(shipment.releasedAmount ?? 0n, decimals)),
+            fxRate.rate,
+            displayCurrency,
+            precisionOverride,
+          ),
+          precision: precisionOverride ?? this.fxRate.getDisplayPrecision(displayCurrency),
+          currency: displayCurrency,
+          rate: fxRate.rate,
+          asOf: fxRate.asOf,
+          estimate: true,
+        }
+      : undefined;
+
+    const trackingUpdates = shipment.trackingUpdates?.map((t: any) => ({
+      id: t.id,
+      location: t.location,
+      latitude: t.latitude,
+      longitude: t.longitude,
+      status: t.status,
+      estimatedArrival: t.estimatedArrival?.toISOString() ?? null,
+      notes: t.notes,
+      createdAt: t.createdAt.toISOString(),
+    }));
+
+    const latestTracking = trackingUpdates && trackingUpdates.length > 0
+      ? trackingUpdates[trackingUpdates.length - 1]
+      : null;
+
+    const { favorites, approvals, ...rest } = shipment;
+    const isFavorited = callerUserId
+      ? Array.isArray(favorites) && favorites.length > 0
+      : false;
+
+    // Multi-signature progress (#234). requiredApprovals is null on the default
+    // single-approver flow, in which case quorum is trivially met.
+    const requiredApprovals: number | null = shipment.requiredApprovals ?? null;
+    const recordedApprovals = Array.isArray(approvals) ? approvals : [];
+    const approvalStatus = {
+      required: requiredApprovals,
+      count: recordedApprovals.length,
+      quorumMet:
+        requiredApprovals === null || recordedApprovals.length >= requiredApprovals,
+      approvals: recordedApprovals,
+    };
+
     return {
-      ...shipment,
+      ...rest,
+      approvalStatus,
       tokenSymbol: symbol,
       tokenDecimals: decimals,
-      // Raw values kept for backward compatibility
       totalAmount: shipment.totalAmount?.toString(),
       releasedAmount: shipment.releasedAmount?.toString(),
-      // Human-readable display values
       totalAmountFormatted: this.stellar.toHumanAmount(shipment.totalAmount ?? 0n, decimals),
       releasedAmountFormatted: this.stellar.toHumanAmount(shipment.releasedAmount ?? 0n, decimals),
+      isFavorited,
       milestones: shipment.milestones?.map((m: any) => {
         const isOverdue =
           m.dueAt &&
@@ -675,6 +2192,8 @@ export class ShipmentsService {
           isOverdue: Boolean(isOverdue),
         };
       }),
+      trackingUpdates,
+      latestTracking,
     };
   }
 }

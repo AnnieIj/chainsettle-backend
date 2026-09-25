@@ -1,5 +1,6 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../../common/prisma/prisma.service';
+import { buildCsvFromRows } from '../../common/utils/csv.util';
 
 export interface RecordAuditLogDto {
   actorId?: string;
@@ -38,14 +39,17 @@ export class AuditLogService {
     try {
       await this.prisma.auditLog.create({
         data: {
-          actorId: dto.actorId,
+          userId: dto.actorId ?? '',
+          actorId: dto.actorId ?? null,
           actorAddress: dto.actorAddress,
           action: dto.action,
+          entityType: dto.resourceType,
+          entityId: dto.resourceId,
           resourceType: dto.resourceType,
           resourceId: dto.resourceId,
           metadata: dto.metadata ?? {},
           ipAddress: dto.ipAddress,
-        },
+        } as any,
       });
 
       this.logger.debug(
@@ -84,10 +88,10 @@ export class AuditLogService {
 
     const where: any = {};
 
-    if (actorAddress) where.actorAddress = actorAddress;
+    if (actorAddress) where.userId = actorAddress;
     if (action) where.action = { contains: action, mode: 'insensitive' };
-    if (resourceType) where.resourceType = resourceType;
-    if (resourceId) where.resourceId = resourceId;
+    if (resourceType) where.entityType = resourceType;
+    if (resourceId) where.entityId = resourceId;
 
     if (startDate || endDate) {
       where.createdAt = {};
@@ -95,11 +99,13 @@ export class AuditLogService {
       if (endDate) where.createdAt.lte = endDate;
     }
 
-    const [logs, total] = await this.prisma.$transaction([
-      this.prisma.auditLog.findMany({
+    // Read-heavy admin list — route through replica when configured
+    const db = this.prisma.read;
+    const [logs, total] = await db.$transaction([
+      db.auditLog.findMany({
         where,
         include: {
-          actor: {
+          user: {
             select: {
               id: true,
               stellarAddress: true,
@@ -112,7 +118,7 @@ export class AuditLogService {
         skip: (page - 1) * limit,
         take: limit,
       }),
-      this.prisma.auditLog.count({ where }),
+      db.auditLog.count({ where }),
     ]);
 
     return {
@@ -126,14 +132,103 @@ export class AuditLogService {
     };
   }
 
+  async exportCsv(filters: {
+    startDate?: Date;
+    endDate?: Date;
+    userId?: string;
+    entityType?: string;
+    entityId?: string;
+  }) {
+    const { startDate, endDate, userId, entityType, entityId } = filters;
+
+    if (startDate && endDate && startDate > endDate) {
+      throw new BadRequestException('startDate must be on or before endDate');
+    }
+
+    const maxRangeDays = 90;
+    if (startDate && endDate) {
+      const diffDays = Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24));
+      if (diffDays > maxRangeDays) {
+        throw new BadRequestException(`Date range cannot exceed ${maxRangeDays} days`);
+      }
+    }
+
+    const where: any = {};
+    if (startDate || endDate) {
+      where.createdAt = {};
+      if (startDate) where.createdAt.gte = startDate;
+      if (endDate) where.createdAt.lte = endDate;
+    }
+    if (userId) where.userId = userId;
+    if (entityType) where.entityType = entityType;
+    if (entityId) where.entityId = entityId;
+
+    const rows = await this.prisma.auditLog.findMany({
+      where,
+      orderBy: { createdAt: 'asc' },
+      select: {
+        id: true,
+        userId: true,
+        action: true,
+        entityType: true,
+        entityId: true,
+        metadata: true,
+        ipAddress: true,
+        createdAt: true,
+      },
+    });
+
+    return buildCsvFromRows(
+      rows.map((row: any) => ({
+        id: row.id,
+        userId: row.userId,
+        action: row.action,
+        entityType: row.entityType,
+        entityId: row.entityId,
+        metadata: row.metadata ? JSON.stringify(row.metadata) : '',
+        ipAddress: row.ipAddress ?? '',
+        createdAt: row.createdAt?.toISOString?.() ?? '',
+      })),
+    );
+  }
+
+  /**
+   * Fetch a single audit log entry by its own ID.
+   * Throws NotFoundException when the ID does not exist.
+   */
+  async findOne(id: string) {
+    const entry = await this.prisma.auditLog.findUnique({
+      where: { id },
+      include: {
+        user: {
+          select: {
+            id: true,
+            stellarAddress: true,
+            name: true,
+            role: true,
+          },
+        },
+      },
+    });
+
+    if (!entry) {
+      throw new NotFoundException(`Audit log entry ${id} not found`);
+    }
+
+    return entry;
+  }
+
   /**
    * Get audit logs for a specific resource (e.g. all actions on a shipment).
    */
   async findByResource(resourceType: string, resourceId: string) {
     return this.prisma.auditLog.findMany({
-      where: { resourceType, resourceId },
+      where: {
+        resourceType,
+        resourceId,
+      },
       include: {
-        actor: {
+        user: {
           select: {
             id: true,
             stellarAddress: true,
@@ -151,7 +246,7 @@ export class AuditLogService {
    */
   async findByActor(actorAddress: string, limit = 100) {
     return this.prisma.auditLog.findMany({
-      where: { actorAddress },
+      where: { userId: actorAddress },
       orderBy: { createdAt: 'desc' },
       take: limit,
     });

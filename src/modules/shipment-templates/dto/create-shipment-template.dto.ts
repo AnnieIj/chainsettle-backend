@@ -11,6 +11,7 @@ import {
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { ApiProperty } from '@nestjs/swagger';
+import { IsStellarAddress } from '../../../common/decorators/is-stellar-address.decorator';
 
 export class MilestoneTemplateDto {
   @ApiProperty({ example: 'Goods Dispatched' })
@@ -44,17 +45,17 @@ export class CreateShipmentTemplateDto {
 
   @ApiProperty({ required: false, example: 'GABC...supplier' })
   @IsOptional()
-  @IsString()
+  @IsStellarAddress()
   supplierAddress?: string;
 
   @ApiProperty({ required: false, example: 'GABC...logistics' })
   @IsOptional()
-  @IsString()
+  @IsStellarAddress()
   logisticsAddress?: string;
 
   @ApiProperty({ required: false, example: 'GABC...arbiter' })
   @IsOptional()
-  @IsString()
+  @IsStellarAddress()
   arbiterAddress?: string;
 
   @ApiProperty({ required: false, example: 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA' })
@@ -87,17 +88,17 @@ export class UpdateShipmentTemplateDto {
 
   @ApiProperty({ required: false, example: 'GABC...supplier' })
   @IsOptional()
-  @IsString()
+  @IsStellarAddress()
   supplierAddress?: string;
 
   @ApiProperty({ required: false, example: 'GABC...logistics' })
   @IsOptional()
-  @IsString()
+  @IsStellarAddress()
   logisticsAddress?: string;
 
   @ApiProperty({ required: false, example: 'GABC...arbiter' })
   @IsOptional()
-  @IsString()
+  @IsStellarAddress()
   arbiterAddress?: string;
 
   @ApiProperty({ required: false, example: 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA' })
@@ -116,4 +117,10 @@ export class UpdateShipmentTemplateDto {
   @IsOptional()
   @IsBoolean()
   isPublic?: boolean;
+}
+
+export class UpdateTemplateVisibilityDto {
+  @ApiProperty({ example: true, description: 'Whether the template should be visible to all users' })
+  @IsBoolean()
+  isPublic: boolean;
 }

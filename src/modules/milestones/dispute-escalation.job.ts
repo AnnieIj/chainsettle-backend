@@ -1,0 +1,108 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
+import { PrismaService } from '../../common/prisma/prisma.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import { MilestoneStatus, NotificationType, UserRole } from '@prisma/client';
+
+/**
+ * DisputeEscalationJob
+ *
+ * Runs hourly. For every milestone that has been in DISPUTED status for longer
+ * than DISPUTE_ESCALATION_DAYS (default 7) without being resolved, sends a
+ * SYSTEM_ALERT notification to every ADMIN user and sets disputeEscalatedAt to
+ * prevent repeated alerts.
+ */
+@Injectable()
+export class DisputeEscalationJob {
+  private readonly logger = new Logger(DisputeEscalationJob.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly notifications: NotificationsService,
+  ) {}
+
+  @Cron(CronExpression.EVERY_HOUR)
+  async checkAndEscalateDisputes() {
+    try {
+      this.logger.log('Starting dispute escalation check...');
+
+      const days = parseInt(process.env.DISPUTE_ESCALATION_DAYS ?? '7', 10);
+      const threshold = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+      const overdue = await this.prisma.milestone.findMany({
+        where: {
+          status: MilestoneStatus.DISPUTED,
+          updatedAt: { lt: threshold },
+          disputeEscalatedAt: null,
+        },
+        include: {
+          shipment: {
+            select: { id: true, arbiterAddress: true },
+          },
+        },
+      });
+
+      if (overdue.length === 0) {
+        this.logger.log('No disputes require escalation');
+        return;
+      }
+
+      this.logger.log(`Found ${overdue.length} dispute(s) requiring escalation`);
+
+      const admins = await this.prisma.user.findMany({
+        where: { role: UserRole.ADMIN },
+        select: { stellarAddress: true },
+      });
+
+      if (admins.length === 0) {
+        this.logger.warn('No admin users found — disputes cannot be escalated');
+      }
+
+      for (const milestone of overdue) {
+        await this.escalate(milestone, admins, days);
+      }
+    } catch (error) {
+      this.logger.error('Dispute escalation check failed', error.message);
+    }
+  }
+
+  private async escalate(
+    milestone: any,
+    admins: { stellarAddress: string }[],
+    days: number,
+  ) {
+    try {
+      const { shipment, milestoneIndex, id } = milestone;
+
+      const title = `Unresolved dispute — shipment ${shipment.id} milestone ${milestoneIndex}`;
+      const message =
+        `Dispute on shipment ${shipment.id} milestone ${milestoneIndex} has been unresolved for over ${days} days. Arbiter: ${shipment.arbiterAddress}.`;
+
+      for (const admin of admins) {
+        await this.notifications.notifyUser(
+          admin.stellarAddress,
+          NotificationType.SYSTEM_ALERT,
+          title,
+          message,
+          {
+            shipmentId: shipment.id,
+            milestoneIndex,
+            arbiterAddress: shipment.arbiterAddress,
+          },
+        );
+      }
+
+      await this.prisma.milestone.update({
+        where: { id },
+        data: { disputeEscalatedAt: new Date() },
+      });
+
+      this.logger.log(`Escalated dispute: shipment ${shipment.id}[${milestoneIndex}]`);
+    } catch (error) {
+      this.logger.error(
+        `Failed to escalate dispute for milestone ${milestone.id}`,
+        error.message,
+      );
+    }
+  }
+}

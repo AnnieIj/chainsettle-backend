@@ -1,14 +1,21 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { ConfigService } from '@nestjs/config';
+import { randomUUID } from 'crypto';
 import { PrismaService } from '../../common/prisma/prisma.service';
+import { RedisService } from '../../common/redis/redis.service';
 import { StellarService } from '../../common/stellar/stellar.service';
 import { MilestonesService } from '../milestones/milestones.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { ShipmentsService } from '../shipments/shipments.service';
+import { MetricsService } from '../../common/metrics/metrics.service';
 import { NotificationType } from '@prisma/client';
 
 const MAX_ATTEMPTS = 5;
+const POLLER_LOCK_KEY = 'chainsettle:event-poller:leader';
+/** Lock TTL must exceed the renew interval so a healthy leader keeps ownership. */
+const POLLER_LOCK_TTL_MS = 15_000;
+const POLLER_LOCK_RENEW_MS = 5_000;
 
 /**
  * EventsService
@@ -22,23 +29,37 @@ const MAX_ATTEMPTS = 5;
  *
  * Failed events are persisted to failed_events (DLQ) and retried with
  * exponential back-off up to MAX_ATTEMPTS times.
+ *
+ * Only one process holds the Redis leader lock at a time so blue/green
+ * deploys (or multi-replica) never double-process chain events.
  */
 @Injectable()
-export class EventsService implements OnModuleInit {
+export class EventsService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(EventsService.name);
-  /** In-memory mirror of the DB cursor — updated after each successful tick. */
+  /** In-memory mirror of the DB cursor — updated after each processed event. */
   private lastProcessedLedger: number = 0;
+  private unsubscribeFn: (() => void) | null = null;
+  private reconnectBackoffMs = 0;
+  private readonly lockToken = randomUUID();
+  private isLeader = false;
+  private leadershipTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private readonly prisma: PrismaService,
+    private readonly redis: RedisService,
     private readonly stellar: StellarService,
     private readonly milestones: MilestonesService,
     private readonly notifications: NotificationsService,
     private readonly shipments: ShipmentsService,
     private readonly config: ConfigService,
+    private readonly metrics: MetricsService,
   ) {}
 
   async onModuleInit() {
+    if (process.env.SDK_GENERATE === '1') {
+      this.logger.warn('Skipping event poller init (SDK_GENERATE=1)');
+      return;
+    }
     try {
       // Attempt to load the persisted cursor from the database
       const cursor = await this.prisma.eventCursor.findUnique({
@@ -69,7 +90,6 @@ export class EventsService implements OnModuleInit {
       this.logger.warn(
         `Could not initialise event cursor from DB: ${error.message} — will retry on first poll`,
       );
-      // Fall back to the Stellar chain tip so we don't replay the entire history
       try {
         const latest = await this.stellar.getLatestLedger();
         this.lastProcessedLedger = Math.max(1, latest - 10);
@@ -77,31 +97,103 @@ export class EventsService implements OnModuleInit {
         this.lastProcessedLedger = 1;
       }
     }
+
+    // Try to become leader immediately; keep contending so a deploy handoff is fast.
+    await this.tryBecomeLeader();
+    this.leadershipTimer = setInterval(() => {
+      void this.tryBecomeLeader();
+    }, POLLER_LOCK_RENEW_MS);
+  }
+
+  async onModuleDestroy() {
+    if (this.leadershipTimer) {
+      clearInterval(this.leadershipTimer);
+      this.leadershipTimer = null;
+    }
+    await this.stepDownAsLeader();
+  }
+
+  private async tryBecomeLeader(): Promise<void> {
+    if (this.isLeader) {
+      const renewed = await this.redis.renewLock(
+        POLLER_LOCK_KEY,
+        this.lockToken,
+        POLLER_LOCK_TTL_MS,
+      );
+      if (!renewed) {
+        this.logger.warn('Lost event-poller leadership — stopping stream');
+        await this.stopStreamSubscription();
+        this.isLeader = false;
+      }
+      return;
+    }
+
+    const acquired = await this.redis.acquireLock(
+      POLLER_LOCK_KEY,
+      this.lockToken,
+      POLLER_LOCK_TTL_MS,
+    );
+    if (!acquired) {
+      return;
+    }
+
+    this.isLeader = true;
+    this.logger.log(`Acquired event-poller leadership (token=${this.lockToken})`);
+    this.startStreamSubscription();
+  }
+
+  private async stepDownAsLeader(): Promise<void> {
+    await this.stopStreamSubscription();
+    if (this.isLeader) {
+      await this.redis.releaseLock(POLLER_LOCK_KEY, this.lockToken);
+      this.isLeader = false;
+      this.logger.log('Released event-poller leadership');
+    }
+  }
+
+  private async stopStreamSubscription(): Promise<void> {
+    if (this.unsubscribeFn) {
+      this.unsubscribeFn();
+      this.unsubscribeFn = null;
+    }
   }
 
   // ----------------------------------------------------------
-  // CRON JOB — runs every 5 seconds
+  // STREAMING SUBSCRIPTION
   // ----------------------------------------------------------
 
-  @Cron(CronExpression.EVERY_5_SECONDS)
-  async pollEvents() {
-    try {
-      const events = await this.stellar.fetchContractEvents(this.lastProcessedLedger);
-      if (events.length === 0) return;
+  private startStreamSubscription(): void {
+    if (this.unsubscribeFn) {
+      this.unsubscribeFn();
+      this.unsubscribeFn = null;
+    }
 
-      this.logger.log(`Processing ${events.length} new chain event(s)`);
+    this.logger.log(
+      `Starting event stream from ledger ${this.lastProcessedLedger}`,
+    );
 
-      for (const event of events) {
+    this.unsubscribeFn = this.stellar.subscribeToContractEvents(
+      this.lastProcessedLedger,
+      async (event) => {
+        this.reconnectBackoffMs = 0;
         try {
           await this.processEvent(event);
         } catch (error) {
+          this.metrics.incrementEventsFailed();
           await this.saveToDlq(event, error as Error);
         }
         this.lastProcessedLedger = Math.max(this.lastProcessedLedger, event.ledger + 1);
+        try {
+          await this.prisma.eventCursor.update({
+            where: { id: 'main' },
+            data: { lastProcessedLedger: this.lastProcessedLedger },
+          });
+          this.logger.debug(`Cursor persisted at ledger ${this.lastProcessedLedger}`);
+        } catch (err) {
+          this.logger.warn(`Cursor DB write failed (in-memory value still correct): ${(err as Error).message}`);
+        }
       }
-    } catch (error) {
-      this.logger.error('Event polling failed', (error as Error).message);
-    }
+    );
   }
 
   // ----------------------------------------------------------
@@ -110,6 +202,11 @@ export class EventsService implements OnModuleInit {
 
   @Cron(CronExpression.EVERY_MINUTE)
   async retryFailedEvents() {
+    // Only the poller leader retries DLQ work to avoid duplicate side-effects.
+    if (!this.isLeader) {
+      return;
+    }
+
     const now = new Date();
 
     const pending = await this.prisma.failedEvent.findMany({
@@ -170,6 +267,7 @@ export class EventsService implements OnModuleInit {
 
     await this.saveRawEvent(eventName, event, payload);
     await this.executeHandler(eventName, payload, event);
+    this.metrics.incrementEventsProcessed(eventName);
   }
 
   private async executeHandler(eventName: string, payload: any, meta: any) {
@@ -237,6 +335,24 @@ export class EventsService implements OnModuleInit {
       ? payload
       : [payload, 0, 0];
 
+    // The buyer may have already registered this confirmation via
+    // POST /shipments/:id/milestones/:index/confirm — skip to avoid
+    // double-notifying the supplier once the on-chain event arrives.
+    const existing = await this.prisma.milestone.findUnique({
+      where: {
+        shipmentId_milestoneIndex: {
+          shipmentId: String(shipmentId),
+          milestoneIndex: Number(milestoneIndex),
+        },
+      },
+    });
+    if (existing?.status === 'CONFIRMED') {
+      this.logger.debug(
+        `Milestone ${shipmentId}[${milestoneIndex}] already confirmed — skipping duplicate event`,
+      );
+      return;
+    }
+
     this.logger.log(
       `Milestone confirmed: ${shipmentId}[${milestoneIndex}] — ${paymentAmount} released`,
     );
@@ -265,6 +381,14 @@ export class EventsService implements OnModuleInit {
         'Payment released',
         `${humanAmount} ${shipment.tokenSymbol} has been released for milestone ${milestoneIndex} on shipment ${shipmentId}.`,
         { shipmentId, milestoneIndex, paymentAmount: humanAmount, tokenSymbol: shipment.tokenSymbol },
+      );
+      
+      await this.notifications.notifyWatchers(
+        shipmentId,
+        NotificationType.MILESTONE_CONFIRMED,
+        'Milestone Confirmed',
+        `Milestone ${milestoneIndex} for shipment ${shipmentId} has been confirmed.`,
+        { shipmentId, milestoneIndex }
       );
     }
   }
@@ -327,8 +451,8 @@ export class EventsService implements OnModuleInit {
   }
 
   private async handleShipmentCancelled(payload: any, event: any) {
-    const [shipmentId] = Array.isArray(payload) ? payload : [payload];
-    this.logger.log(`Shipment cancelled: ${shipmentId}`);
+    const [shipmentId, refundAmount] = Array.isArray(payload) ? payload : [payload, undefined];
+    this.logger.log(`Shipment cancelled on-chain: ${shipmentId}`);
 
     await this.prisma.shipment.update({
       where: { id: String(shipmentId) },
@@ -429,6 +553,10 @@ export class EventsService implements OnModuleInit {
     this.logger.log(`Admin manually retried and resolved failed event ${id}`);
   }
 
+  async getFailedEventById(id: string) {
+    return this.prisma.failedEvent.findUniqueOrThrow({ where: { id } });
+  }
+
   // ----------------------------------------------------------
   // READ ENDPOINTS (for EventsController)
   // ----------------------------------------------------------
@@ -463,14 +591,16 @@ export class EventsService implements OnModuleInit {
       };
     }
 
-    const [events, total] = await this.prisma.$transaction([
-      this.prisma.chainEvent.findMany({
+    // Read-heavy list — route through replica when configured
+    const db = this.prisma.read;
+    const [events, total] = await db.$transaction([
+      db.chainEvent.findMany({
         where,
         orderBy: { ledger: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
       }),
-      this.prisma.chainEvent.count({ where }),
+      db.chainEvent.count({ where }),
     ]);
 
     return { 
@@ -481,6 +611,26 @@ export class EventsService implements OnModuleInit {
         limit,
         totalPages: Math.ceil(total / limit)
       } 
+    };
+  }
+
+  /**
+   * Admin diagnostics: compares the in-memory cursor against the
+   * DB-persisted one and the live chain tip to surface poller lag.
+   */
+  async getCursorStatus() {
+    const persisted = await this.prisma.eventCursor.findUnique({ where: { id: 'main' } });
+    const chainTip = await this.stellar.getLatestLedger();
+    const lag = chainTip - this.lastProcessedLedger;
+
+    return {
+      inMemoryLedger: this.lastProcessedLedger,
+      persistedLedger: persisted?.lastProcessedLedger ?? null,
+      chainTip,
+      lag,
+      updatedAt: persisted?.updatedAt ?? null,
+      healthy: lag <= 100,
+      isPollerLeader: this.isLeader,
     };
   }
 
@@ -505,7 +655,7 @@ export class EventsService implements OnModuleInit {
   }
 
   private async saveRawEvent(eventName: string, event: any, payload: any, tx?: any) {
-    const client = tx ?? this.prisma;
+    const client = tx || this.prisma;
     try {
       const shipmentId = this.extractShipmentId(payload);
 

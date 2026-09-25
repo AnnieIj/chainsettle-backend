@@ -1,9 +1,10 @@
 import {
   Controller,
   Get,
+  Param,
   Query,
+  Res,
   UseGuards,
-  ForbiddenException,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -11,11 +12,13 @@ import {
   ApiResponse,
   ApiBearerAuth,
   ApiQuery,
+  ApiParam,
 } from '@nestjs/swagger';
+import { Response } from 'express';
+import { UserRole } from '@prisma/client';
 import { AuditLogService } from './audit-log.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
-import { CurrentUser } from '../../common/decorators/current-user.decorator';
-import { UserRole } from '@prisma/client';
+import { Roles } from '../../common/decorators/roles.decorator';
 
 @ApiTags('admin')
 @ApiBearerAuth()
@@ -30,6 +33,7 @@ export class AuditLogsController {
    * Restricted to users with role = ADMIN.
    */
   @Get()
+  @Roles(UserRole.ADMIN)
   @ApiOperation({ summary: 'Get audit logs (admin only)' })
   @ApiResponse({ status: 200, description: 'Audit logs retrieved' })
   @ApiResponse({ status: 403, description: 'Not authorized (admin only)' })
@@ -42,7 +46,6 @@ export class AuditLogsController {
   @ApiQuery({ name: 'page', required: false, type: Number, description: 'Page number (default 1)' })
   @ApiQuery({ name: 'limit', required: false, type: Number, description: 'Items per page (default 50)' })
   async findAll(
-    @CurrentUser() user: any,
     @Query('actorAddress') actorAddress?: string,
     @Query('action') action?: string,
     @Query('resourceType') resourceType?: string,
@@ -52,12 +55,6 @@ export class AuditLogsController {
     @Query('page') page?: number,
     @Query('limit') limit?: number,
   ) {
-    // Enforce admin-only access
-    if (user.role !== UserRole.ADMIN) {
-      throw new ForbiddenException('Only admins can access audit logs');
-    }
-
-    // Parse date strings
     const startDate = startDateStr ? new Date(startDateStr) : undefined;
     const endDate = endDateStr ? new Date(endDateStr) : undefined;
 
@@ -77,23 +74,56 @@ export class AuditLogsController {
    * GET /api/v1/admin/audit-logs/resource/:resourceType/:resourceId
    * Get all audit logs for a specific resource (read-only for details).
    */
+  @Get('export')
+  @Roles(UserRole.ADMIN)
+  @ApiOperation({ summary: 'Export audit logs as CSV (admin only)' })
+  @ApiResponse({ status: 200, description: 'CSV export generated' })
+  @ApiResponse({ status: 403, description: 'Not authorized (admin only)' })
+  @ApiQuery({ name: 'startDate', required: false, type: String, description: 'ISO 8601 start date' })
+  @ApiQuery({ name: 'endDate', required: false, type: String, description: 'ISO 8601 end date' })
+  @ApiQuery({ name: 'userId', required: false, type: String, description: 'Filter by user ID' })
+  @ApiQuery({ name: 'entityType', required: false, type: String, description: 'Filter by entity type' })
+  @ApiQuery({ name: 'entityId', required: false, type: String, description: 'Filter by entity ID' })
+  async exportCsv(
+    @Query('startDate') startDateStr?: string,
+    @Query('endDate') endDateStr?: string,
+    @Query('userId') userId?: string,
+    @Query('entityType') entityType?: string,
+    @Query('entityId') entityId?: string,
+    @Res() res?: Response,
+  ) {
+    const startDate = startDateStr ? new Date(startDateStr) : undefined;
+    const endDate = endDateStr ? new Date(endDateStr) : undefined;
+
+    const csv = await this.auditLogService.exportCsv({ startDate, endDate, userId, entityType, entityId });
+    res?.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res?.setHeader('Content-Disposition', 'attachment; filename="audit-logs.csv"');
+    res?.send(csv);
+  }
+
   @Get('resource/:resourceType/:resourceId')
+  @Roles(UserRole.ADMIN)
   @ApiOperation({ summary: 'Get audit logs for a specific resource (admin only)' })
   @ApiResponse({ status: 200, description: 'Audit logs for resource' })
   @ApiResponse({ status: 403, description: 'Not authorized (admin only)' })
-  async findByResource(
-    @CurrentUser() user: any,
-    // @Param('resourceType') resourceType: string,
-    // @Param('resourceId') resourceId: string,
-  ) {
-    // Enforce admin-only access
-    if (user.role !== UserRole.ADMIN) {
-      throw new ForbiddenException('Only admins can access audit logs');
-    }
-
-    // Note: We don't actually use the params from the route because the route is
-    // /resource/:resourceType/:resourceId but we're using @Get() with a nested path.
-    // In production, you'd implement this properly with @Param decorators.
+  async findByResource() {
     return { message: 'Use GET /admin/audit-logs with filters instead' };
+  }
+
+  /**
+   * GET /api/v1/admin/audit-logs/:id
+   * Fetch a single audit log entry by its own ID.
+   * Declared last so it doesn't swallow the more specific 'export' and
+   * 'resource/:resourceType/:resourceId' routes above.
+   */
+  @Get(':id')
+  @Roles(UserRole.ADMIN)
+  @ApiOperation({ summary: 'Get a single audit log entry by ID (admin only)' })
+  @ApiParam({ name: 'id', description: 'Audit log entry ID' })
+  @ApiResponse({ status: 200, description: 'Audit log entry retrieved' })
+  @ApiResponse({ status: 403, description: 'Not authorized (admin only)' })
+  @ApiResponse({ status: 404, description: 'Audit log entry not found' })
+  async findOne(@Param('id') id: string) {
+    return this.auditLogService.findOne(id);
   }
 }

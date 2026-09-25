@@ -46,10 +46,13 @@ enum NotificationType {
   PAYMENT_RELEASED
   MILESTONE_OVERDUE
   COMMENT_ADDED
+  COMMENT_MENTION
   SYSTEM_ALERT
   ARBITER_INVITED
   ARBITER_ACCEPTED
   ARBITER_DECLINED
+  TRACKING_UPDATED
+  PROOF_REJECTED
 }
 
 enum CommentVisibility {
@@ -71,6 +74,13 @@ enum UserRole {
   ADMIN
 }
 
+enum KycStatus {
+  UNVERIFIED
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
 // ============================================================
 // MODELS
 // ============================================================
@@ -83,6 +93,9 @@ model User {
   pendingEmail     String?
   name             String?
   role             UserRole  @default(BUYER)
+  deactivatedAt    DateTime? // set when the user deactivates their account (soft-delete)
+  kycStatus        KycStatus @default(UNVERIFIED)
+  kycReference     String?   // opaque verification reference/ID from the KYC provider — never raw identity documents
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
 
@@ -95,9 +108,16 @@ model User {
   auditLogs          AuditLog[]     @relation("AuditLogs")
   disputeEvidence    DisputeEvidence[]
   comments           ShipmentComment[]
+  shipmentNotes      ShipmentNote[]
+  trackingUpdates    TrackingUpdate[]
   shipmentTemplates  ShipmentTemplate[] @relation("ShipmentTemplates")
   webhookEndpoints      WebhookEndpoint[]
+  apiKeys     ApiKey[]
+  deviceTokens DeviceToken[]
   notificationPreference NotificationPreference?
+  shipmentWatchers ShipmentWatcher[] @relation("ShipmentWatchers")
+  shipmentFavorites ShipmentFavorite[] @relation("ShipmentFavorites")
+  savedFilters      SavedFilter[]      @relation("SavedFilters")
 
   @@map("users")
 }
@@ -122,6 +142,7 @@ model Shipment {
 
   // Human-readable context fields
   description      String?         // what goods are being shipped (max 1000 chars)
+  description_search Unsupported("tsvector")?
   referenceNumber  String?         @unique // contract/PO reference for external systems
   metadata         Json?           // arbitrary key-value pairs (incoterms, port, etc)
   tags             String[]        @default([]) // searchable tags
@@ -141,6 +162,13 @@ model Shipment {
   milestones Milestone[]
   events    ChainEvent[]
   comments  ShipmentComment[]
+  shipmentNotes ShipmentNote[]
+  trackingUpdates TrackingUpdate[]
+  watchers  ShipmentWatcher[]
+  favorites ShipmentFavorite[]
+  approvals ShipmentApproval[]
+
+  isDraft          Boolean         @default(false) // true when created via CSV bulk import; no on-chain backing yet
 
   @@map("shipments")
 }
@@ -157,15 +185,33 @@ model Milestone {
   confirmedAt        DateTime?
   dueAt              DateTime?       // optional deadline for milestone completion
   overdueNotifiedAt  DateTime?       // timestamp when overdue notification was sent (prevents re-notification)
+  overdueReminder3dAt DateTime?       // timestamp when 3-day escalation notification was sent
+  disputeEscalatedAt DateTime?       // set when the dispute has been escalated to admins (prevents re-escalation)
   createdAt          DateTime        @default(now())
   updatedAt          DateTime        @updatedAt
 
   // Relations
   shipment        Shipment          @relation(fields: [shipmentId], references: [id])
   disputeEvidence DisputeEvidence[]
+  proofSubmissions ProofSubmission[]
 
   @@unique([shipmentId, milestoneIndex])
   @@map("milestones")
+}
+
+model ProofSubmission {
+  id          String   @id @default(uuid())
+  milestoneId String
+  ipfsCid     String   // IPFS CID of the uploaded proof
+  submittedBy String   // Stellar address of whoever uploaded
+  createdAt   DateTime @default(now())
+
+  // Relations
+  milestone Milestone @relation(fields: [milestoneId], references: [id], onDelete: Cascade)
+
+  @@index([milestoneId])
+  @@index([submittedBy])
+  @@map("proof_submissions")
 }
 
 model DisputeEvidence {
@@ -229,6 +275,14 @@ model Notification {
   @@map("notifications")
 }
 
+model EventCursor {
+  id                  String   @id
+  lastProcessedLedger Int
+  updatedAt           DateTime @updatedAt
+
+  @@map("event_cursors")
+}
+
 model FailedEvent {
   id            String    @id @default(uuid())
   eventName     String
@@ -253,6 +307,7 @@ model ShipmentComment {
   body          String            @db.VarChar(2000)
   visibility    CommentVisibility @default(ALL)
   attachmentCid String?
+  pinnedAt      DateTime?         // set when pinned; null when unpinned (max 3 per shipment)
   createdAt     DateTime          @default(now())
   updatedAt     DateTime          @updatedAt
   deletedAt     DateTime?
@@ -265,12 +320,52 @@ model ShipmentComment {
   @@map("shipment_comments")
 }
 
+model ShipmentNote {
+  id         String   @id @default(uuid())
+  shipmentId String
+  authorId   String
+  body       String   @db.VarChar(2000)
+  createdAt  DateTime @default(now())
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  author   User     @relation(fields: [authorId], references: [id])
+
+  @@index([shipmentId])
+  @@index([authorId])
+  @@map("shipment_notes")
+}
+
+model TrackingUpdate {
+  id               String    @id @default(uuid())
+  shipmentId       String
+  submittedBy      String
+  location         String    // e.g. "Port of Lagos"
+  latitude         Float?
+  longitude        Float?
+  status           String    // e.g. "In Transit", "Customs Clearance", "Out for Delivery"
+  estimatedArrival DateTime?
+  notes            String?   @db.VarChar(500)
+  createdAt        DateTime  @default(now())
+
+  shipment   Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  user       User     @relation(fields: [submittedBy], references: [stellarAddress])
+
+  @@index([shipmentId])
+  @@index([submittedBy])
+  @@index([createdAt])
+  @@map("tracking_updates")
+}
+
 model AuditLog {
   id             String   @id @default(uuid())
   userId         String
+  actorId        String?
+  actorAddress   String?
   action         String
   entityType     String
   entityId       String?
+  resourceType   String?
+  resourceId     String?
   metadata       Json?
   ipAddress      String?
   createdAt      DateTime @default(now())
@@ -283,11 +378,12 @@ model AuditLog {
 }
 
 model NotificationPreference {
-  id          String   @id @default(uuid())
-  userId      String   @unique
-  preferences Json     // Record<NotificationType, { inApp: boolean; email: boolean }>
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id              String   @id @default(uuid())
+  userId          String   @unique
+  preferences     Json     // Record<NotificationType, { inApp: boolean; email: boolean; slack: boolean }>
+  slackWebhookUrl String?  // Incoming Slack webhook URL; null disables Slack delivery
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -311,21 +407,36 @@ model WebhookEndpoint {
 }
 
 model WebhookDelivery {
-  id           String    @id @default(uuid())
-  endpointId   String
-  eventType    String
-  payload      Json
-  statusCode   Int?
-  responseBody String?
-  deliveredAt  DateTime?
-  nextRetryAt  DateTime?
-  attemptCount Int       @default(0)
+  id                  String    @id @default(uuid())
+  endpointId          String
+  eventType           String
+  payload             Json
+  statusCode          Int?
+  responseBody        String?
+  deliveredAt         DateTime?
+  nextRetryAt         DateTime?
+  attemptCount        Int       @default(0)
+  /// Set when all retry attempts are exhausted — delivery is permanently failed.
+  permanentlyFailedAt DateTime?
+  createdAt           DateTime  @default(now())
 
   endpoint WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
 
   @@index([endpointId])
   @@index([nextRetryAt])
+  @@index([permanentlyFailedAt])
   @@map("webhook_deliveries")
+}
+
+model ReconciliationRun {
+  id            String    @id @default(uuid())
+  startedAt     DateTime  @default(now())
+  completedAt   DateTime?
+  checkedCount  Int       @default(0)
+  mismatchCount Int       @default(0)
+  errors        Json?
+
+  @@map("reconciliation_runs")
 }
 
 model ShipmentTemplate {
@@ -350,3 +461,128 @@ model ShipmentTemplate {
   @@map("shipment_templates")
 }
 
+model ApiKey {
+  id          String    @id @default(uuid())
+  userId      String
+  keyHash     String    @unique  // SHA-256 hash of the plaintext key
+  name        String             // human label e.g. "CI Pipeline"
+  lastUsedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  revokedAt   DateTime?          // null = active, set = revoked
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([keyHash])
+  @@index([userId])
+  @@map("api_keys")
+}
+
+model DeviceToken {
+  id        String   @id @default(uuid())
+  userId    String
+  token     String   @unique // FCM registration token
+  platform  String   @default("fcm") // "fcm" (covers Android + iOS via FCM)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("device_tokens")
+}
+
+model AppConfig {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@map("app_config")
+}
+
+/// A single co-approver signing off on a high-value shipment. Milestone
+/// confirmation is blocked until the shipment has `requiredApprovals` rows
+/// here. One row per approver address, enforced by the unique constraint.
+/// A named, reusable set of GET /shipments filter criteria, private to the
+/// user who created it. `filter` holds only filter fields; pagination is a
+/// per-request concern and is never stored.
+model SavedFilter {
+  id        String   @id @default(uuid())
+  userId    String
+  name      String
+  filter    Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation("SavedFilters", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, name])
+  @@index([userId])
+  @@map("saved_filters")
+}
+
+model ShipmentApproval {
+  id              String   @id @default(uuid())
+  shipmentId      String
+  approverAddress String
+  note            String?
+  createdAt       DateTime @default(now())
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+
+  @@unique([shipmentId, approverAddress])
+  @@index([shipmentId])
+  @@map("shipment_approvals")
+}
+
+model ShipmentFavorite {
+  id         String   @id @default(uuid())
+  shipmentId String
+  userId     String
+  createdAt  DateTime @default(now())
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  user     User     @relation("ShipmentFavorites", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([shipmentId, userId])
+  @@index([userId])
+  @@map("shipment_favorites")
+}
+
+model ShipmentWatcher {
+  id         String   @id @default(uuid())
+  shipmentId String
+  userId     String
+  createdAt  DateTime @default(now())
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  user     User     @relation("ShipmentWatchers", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([shipmentId, userId])
+  @@index([userId])
+  @@map("shipment_watchers")
+}
+
+
+/// Cold-storage copy of a COMPLETED/CANCELLED shipment moved out of the hot
+/// `shipments` table by the scheduled archival job. `payload` retains the full
+/// relational snapshot (milestones, events, comments, tracking, notes, evidence).
+model ArchivedShipment {
+  id               String         @id // original shipment id
+  status           ShipmentStatus
+  buyerAddress     String
+  supplierAddress  String
+  logisticsAddress String
+  arbiterAddress   String
+  referenceNumber  String?
+  terminalAt       DateTime       // when shipment became COMPLETED/CANCELLED
+  archivedAt       DateTime       @default(now())
+  payload          Json           // full history snapshot for compliance/reference
+
+  @@index([buyerAddress])
+  @@index([supplierAddress])
+  @@index([logisticsAddress])
+  @@index([arbiterAddress])
+  @@index([status])
+  @@index([archivedAt])
+  @@index([terminalAt])
+  @@map("archived_shipments")
+}

@@ -1,5 +1,6 @@
-import { Controller, Get, Patch, Put, Param, Query, Body, UseGuards } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Delete, Param, Query, Body, UseGuards, NotFoundException } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth, ApiQuery } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
 import { NotificationsService } from './notifications.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -38,15 +39,43 @@ export class NotificationsController {
     return this.notificationsService.markAllRead(userId);
   }
 
+  @Delete('read')
+  @ApiOperation({ summary: 'Delete all read notifications for the authenticated user' })
+  deleteAllRead(@CurrentUser('id') userId: string) {
+    return this.notificationsService.deleteAllRead(userId);
+  }
+
   @Get('preferences')
   @ApiOperation({ summary: 'Get notification preferences for the authenticated user' })
   getPreferences(@CurrentUser('id') userId: string) {
-    return this.notificationsService.getOrCreatePreferences(userId);
+    return this.notificationsService.getPreferencesResponse(userId);
   }
 
-  @Put('preferences')
+  @Patch('preferences')
   @ApiOperation({ summary: 'Update notification preferences (partial merge)' })
   updatePreferences(@CurrentUser('id') userId: string, @Body() dto: UpdatePreferencesDto) {
     return this.notificationsService.updatePreferences(userId, dto);
+  }
+
+  @Post('test')
+  @Throttle({ default: { limit: 1, ttl: 5 * 60 * 1000 } })
+  @ApiOperation({ summary: 'Send a test notification to yourself' })
+  sendTestNotification(@CurrentUser('id') userId: string) {
+    return this.notificationsService.sendTestNotification(userId);
+  }
+
+  @Get('digest-preview')
+  @ApiOperation({ summary: 'Preview the next scheduled email digest' })
+  async getDigestPreview(@CurrentUser('id') userId: string) {
+    const digest = await this.notificationsService.buildDigest(userId);
+    return digest || { subject: '', html: '' };
+  }
+
+  @Get(':id')
+  @ApiOperation({ summary: 'Fetch a single notification by ID' })
+  async findOne(@Param('id') id: string, @CurrentUser('id') userId: string) {
+    const notification = await this.notificationsService.findOne(userId, id);
+    if (!notification) throw new NotFoundException('Notification not found');
+    return notification;
   }
 }

@@ -2,6 +2,8 @@ import {
   IsString,
   IsNotEmpty,
   IsArray,
+  ArrayMinSize,
+  ArrayMaxSize,
   ValidateNested,
   IsInt,
   Min,
@@ -13,8 +15,8 @@ import {
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { ApiProperty } from '@nestjs/swagger';
-// Add the import for your custom validator
 import { IsMilestoneSumValid } from '../../../common/validators/milestone-sum.validator';
+import { IsStellarAddress } from '../../../common/decorators/is-stellar-address.decorator';
 
 export class MilestoneDto {
   @ApiProperty({ example: 'Goods Dispatched' })
@@ -46,23 +48,23 @@ export class CreateShipmentDto {
   templateId?: string;
 
   @ApiProperty({ example: 'GABC...buyer' })
-  @IsString()
+  @IsStellarAddress()
   @IsNotEmpty()
   buyerAddress: string;
 
   @ApiProperty({ example: 'GABC...supplier', required: false })
   @IsOptional()
-  @IsString()
+  @IsStellarAddress()
   supplierAddress?: string;
 
   @ApiProperty({ example: 'GABC...logistics', required: false })
   @IsOptional()
-  @IsString()
+  @IsStellarAddress()
   logisticsAddress?: string;
 
   @ApiProperty({ example: 'GABC...arbiter', required: false })
   @IsOptional()
-  @IsString()
+  @IsStellarAddress()
   arbiterAddress?: string;
 
   @ApiProperty({ example: 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA', required: false })
@@ -109,6 +111,38 @@ export class CreateShipmentDto {
   @IsArray()
   @IsString({ each: true })
   tags?: string[];
+
+  @ApiProperty({
+    required: false,
+    example: 2,
+    description:
+      'Co-approvals required before any milestone may be confirmed. Only accepted ' +
+      'for shipments at or above MULTISIG_VALUE_THRESHOLD_STROOPS; omit for smaller ' +
+      'shipments, which use the single-approver flow.',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  requiredApprovals?: number;
+}
+
+export class ApproveShipmentDto {
+  @ApiProperty({
+    required: false,
+    example: 'Reviewed against PO-2026-001 and approved by finance.',
+    description: 'Optional note recorded alongside the approval',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  note?: string;
+}
+
+export class CancelShipmentDto {
+  @ApiProperty({ example: 'abc123...', description: 'On-chain transaction hash of the cancel call' })
+  @IsString()
+  @IsNotEmpty()
+  txHash: string;
 }
 
 export class UpdateShipmentDto {
@@ -133,4 +167,26 @@ export class UpdateShipmentDto {
   @IsArray()
   @IsString({ each: true })
   tags?: string[];
+}
+
+export class BulkStatusDto {
+  @ApiProperty({ type: [String], example: ['SHIP-001', 'SHIP-002'], description: 'Shipment IDs to look up (1–50 items)' })
+  @IsArray()
+  @ArrayMinSize(1)
+  @ArrayMaxSize(50)
+  @IsString({ each: true })
+  @IsNotEmpty({ each: true })
+  ids: string[];
+}
+
+export class CloneShipmentDto {
+  @ApiProperty({ example: 'abc123...txhash', description: 'On-chain transaction hash for the new cloned shipment' })
+  @IsString()
+  @IsNotEmpty()
+  txHash: string;
+
+  @ApiProperty({ example: '1000000000', description: 'Total amount in stroops for the new shipment (7 decimal places)' })
+  @IsString()
+  @IsNotEmpty()
+  totalAmount: string;
 }

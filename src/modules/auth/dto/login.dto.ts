@@ -1,9 +1,10 @@
 import { IsString, IsNotEmpty, Matches } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
+import { IsStellarAddress } from '../../../common/decorators/is-stellar-address.decorator';
 
 export class LoginDto {
   @ApiProperty({ example: 'GABC...XYZ', description: 'Stellar public key' })
-  @IsString()
+  @IsStellarAddress()
   @IsNotEmpty()
   stellarAddress: string;
 
